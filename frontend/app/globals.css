@@ -1,0 +1,57 @@
+@import "tailwindcss";
+
+:root {
+  --background: #F8F9FA;
+  --foreground: #1A1A1A;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: 'DM Sans', system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.shimmer {
+  background: linear-gradient(
+    90deg,
+    #E5E7EB 25%,
+    #D1D5DB 50%,
+    #E5E7EB 75%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.5s infinite;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: #F1F1F1; }
+::-webkit-scrollbar-thumb { background: #D1D5DB; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #9CA3AF; }
+
+/* Smooth focus outlines */
+*:focus-visible {
+  outline: 2px solid #16A34A;
+  outline-offset: 2px;
+}
+
+/* Suppress all focus rings inside the sentiment chart */
+.sentiment-chart-root *:focus,
+.sentiment-chart-root *:focus-visible {
+  outline: none !important;
+}

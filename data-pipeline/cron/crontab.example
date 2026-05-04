@@ -1,0 +1,21 @@
+# Stock Market Indicator — example crontab entries
+# Install with: crontab data-pipeline/cron/crontab.example
+# Adjust PROJECT_DIR to your actual path.
+# The scripts self-activate backend/.venv, so no need to point PYTHON at the venv.
+
+PROJECT_DIR=/path/to/stock-market-indicator
+
+# News ingestor — every 30 minutes
+*/30 * * * *  cd $PROJECT_DIR && python3 data-pipeline/run_ingestors.py news >> /var/log/smi/news.log 2>&1
+
+# Social (Reddit) ingestor — every 15 minutes
+*/15 * * * *  cd $PROJECT_DIR && python3 data-pipeline/run_ingestors.py social >> /var/log/smi/social.log 2>&1
+
+# Market (Polygon) ingestor — every hour at :00
+0    * * * *  cd $PROJECT_DIR && python3 data-pipeline/run_ingestors.py market >> /var/log/smi/market.log 2>&1
+
+# Ranking engine — every minute
+*    * * * *  cd $PROJECT_DIR && python3 data-pipeline/run_ranking.py >> /var/log/smi/ranking.log 2>&1
+
+# Database backup — daily at 02:00, keeps 7 days of compressed dumps in backups/
+0    2 * * *  PROJECT_DIR=$PROJECT_DIR $PROJECT_DIR/data-pipeline/backup_db.sh >> /var/log/smi/backup.log 2>&1
