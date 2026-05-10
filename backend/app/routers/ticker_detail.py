@@ -7,6 +7,7 @@ Ticker detail endpoints:
 """
 
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -21,6 +22,15 @@ from app.schemas.search import NewsItem, TickerDetailResponse, TickerNewsRespons
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/ticker", tags=["ticker"])
+
+_OUTLET_SUFFIX_RE = re.compile(r"\s+-\s+[^-]+$")
+
+
+def _title_key(title: str | None) -> str:
+    """Normalised, outlet-stripped title for near-duplicate detection."""
+    if not title:
+        return ""
+    return _OUTLET_SUFFIX_RE.sub("", title).strip().lower()
 
 WINDOW_HOURS: dict[str, int] = {"6h": 6, "24h": 24, "3d": 72, "7d": 168}
 
@@ -44,31 +54,20 @@ async def get_ticker_news(
     now = datetime.now(tz=timezone.utc)
     cutoff = now - timedelta(hours=WINDOW_HOURS[window])
 
-    from sqlalchemy import func as sqlfunc
-    canonical = (
-        select(sqlfunc.min(Article.id).label("canonical_id"))
-        .join(TickerMention, TickerMention.article_id == Article.id)
-        .where(TickerMention.ticker == sym)
-        .where(Article.timestamp >= cutoff)
-        .group_by(sqlfunc.lower(Article.title))
-        .order_by(sqlfunc.min(Article.id).desc())
-        .limit(limit)
-        .subquery()
-    )
-
     rows = await db.execute(
         select(Article.id, Article.source, Article.title, Article.url, Article.timestamp, TickerMention.sentiment)
         .join(TickerMention, TickerMention.article_id == Article.id)
-        .where(Article.id.in_(select(canonical.c.canonical_id)))
         .where(TickerMention.ticker == sym)
-        .distinct(Article.id)
-        .order_by(Article.id.desc())
+        .where(Article.timestamp >= cutoff)
+        .where(Article.source != "stocktwits")
+        .order_by(Article.timestamp.desc())
+        .limit(limit)
     )
 
     seen_titles: set[str] = set()
     news: list[NewsItem] = []
     for row in rows:
-        key = row.title.lower().strip() if row.title else str(row.id)
+        key = _title_key(row.title) or str(row.id)
         if key in seen_titles:
             continue
         seen_titles.add(key)
@@ -109,6 +108,7 @@ async def get_ticker_detail(
         .join(Article, Article.id == TickerMention.article_id)
         .where(TickerMention.ticker == sym)
         .where(Article.timestamp >= cutoff_1h)
+        .where(Article.source != "stocktwits")
     )
     mentions_1h: int = agg_1h.scalar_one() or 0
 
@@ -120,14 +120,26 @@ async def get_ticker_detail(
         .join(Article, Article.id == TickerMention.article_id)
         .where(TickerMention.ticker == sym)
         .where(Article.timestamp >= cutoff)
+        .where(Article.source != "stocktwits")
     )
     row = agg_window.one()
     mentions_window: int = row.cnt or 0
     avg_sentiment: float | None = float(row.sent) if row.sent is not None else None
 
+    cutoff_15m = now - timedelta(minutes=15)
+    gauge_row = await db.execute(
+        select(func.avg(TickerMention.sentiment))
+        .join(Article, Article.id == TickerMention.article_id)
+        .where(TickerMention.ticker == sym)
+        .where(Article.timestamp >= cutoff_15m)
+        .where(Article.source != "stocktwits")
+    )
+    gauge_raw = gauge_row.scalar_one_or_none()
+    gauge_sentiment_15m: float | None = round(float(gauge_raw), 4) if gauge_raw is not None else None
+
     sent_val = avg_sentiment or 0.0
     score = round(mentions_1h * 3 + mentions_window * 1.5 + sent_val * 2, 4)
-    hourly_avg = mentions_window / hours if mentions_window else 0
+    hourly_avg = mentions_window / hours if hours else 0
     spike = mentions_1h > (hourly_avg * 2) if hourly_avg > 0 else False
 
     return TickerDetailResponse(
@@ -139,4 +151,5 @@ async def get_ticker_detail(
         sentiment=round(avg_sentiment, 4) if avg_sentiment is not None else None,
         score=score,
         spike=spike,
+        gauge_sentiment_15m=gauge_sentiment_15m,
     )

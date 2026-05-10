@@ -11,6 +11,8 @@ from app.config import settings
 from app.models.article import Article
 from app.models.ticker_mention import TickerMention
 from app.schemas.normalized import NormalizedItem
+from app.utils.embeddings import encode
+from app.utils.minhash_dedup import compute_minhash, is_near_duplicate, load_recent_signatures
 from app.utils.sentiment import analyze_sentiment
 from app.utils.ticker_extractor import extract_tickers_db
 
@@ -46,8 +48,10 @@ async def _ingest_twitter(db: AsyncSession) -> list[NormalizedItem]:
         logger.warning("twitter_bearer_token not set — skipping Twitter ingest")
         return []
 
+    recent_signatures = await load_recent_signatures(db)
     results: list[NormalizedItem] = []
     seen_ids: set[str] = set()
+    seen_sigs: list[list[int]] = list(recent_signatures)
     headers = {"Authorization": f"Bearer {settings.twitter_bearer_token}"}
 
     async with httpx.AsyncClient(timeout=15) as client:
@@ -69,6 +73,10 @@ async def _ingest_twitter(db: AsyncSession) -> list[NormalizedItem]:
                     continue
                 seen_ids.add(tweet["id"])
                 item = _normalize_tweet(tweet)
+                sig = compute_minhash(item.content)
+                if is_near_duplicate(sig, seen_sigs):
+                    continue
+                seen_sigs.append(sig)
                 item.tickers = await extract_tickers_db(item.content, db)
                 article = Article(
                     source=item.source,
@@ -76,6 +84,8 @@ async def _ingest_twitter(db: AsyncSession) -> list[NormalizedItem]:
                     content=item.content,
                     url=item.url,
                     timestamp=item.timestamp,
+                    minhash_signature=sig,
+                    embedding=await encode(item.content),
                 )
                 db.add(article)
                 await db.flush()
@@ -85,6 +95,7 @@ async def _ingest_twitter(db: AsyncSession) -> list[NormalizedItem]:
                             ticker=symbol,
                             article_id=article.id,
                             sentiment=item.sentiment,
+                            source_weight=0.3,
                         )
                     )
                 results.append(item)
@@ -105,6 +116,8 @@ async def _ingest_reddit(db: AsyncSession) -> list[NormalizedItem]:
         user_agent=settings.reddit_user_agent,
         read_only=True,
     )
+    recent_signatures = await load_recent_signatures(db)
+    seen_sigs: list[list[int]] = list(recent_signatures)
     results: list[NormalizedItem] = []
     for sub_name in ["stocks", "wallstreetbets", "investing", "StockMarket"]:
         for post in reddit.subreddit(sub_name).hot(limit=25):
@@ -120,6 +133,10 @@ async def _ingest_reddit(db: AsyncSession) -> list[NormalizedItem]:
                 tickers=[],
                 sentiment=analyze_sentiment(f"{post.title} {content}"),
             )
+            sig = compute_minhash(item.content)
+            if is_near_duplicate(sig, seen_sigs):
+                continue
+            seen_sigs.append(sig)
             item.tickers = await extract_tickers_db(
                 f"{item.title or ''} {item.content}", db
             )
@@ -129,6 +146,8 @@ async def _ingest_reddit(db: AsyncSession) -> list[NormalizedItem]:
                 content=item.content,
                 url=item.url,
                 timestamp=item.timestamp,
+                minhash_signature=sig,
+                embedding=await encode(f"{item.title or ''} {item.content}"),
             )
             db.add(article)
             await db.flush()
@@ -138,6 +157,7 @@ async def _ingest_reddit(db: AsyncSession) -> list[NormalizedItem]:
                         ticker=symbol,
                         article_id=article.id,
                         sentiment=item.sentiment,
+                        source_weight=0.2,
                     )
                 )
             results.append(item)

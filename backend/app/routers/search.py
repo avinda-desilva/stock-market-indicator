@@ -10,6 +10,7 @@ Pipeline:
 import logging
 from datetime import datetime, timedelta, timezone
 
+import numpy as np
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -19,6 +20,7 @@ from app.models.article import Article
 from app.models.ticker import Ticker
 from app.models.ticker_mention import TickerMention
 from app.schemas.search import NewsItem, SearchResponse, TickerScore, TrendData
+from app.utils.embeddings import encode as embed_query
 from app.utils.query_pipeline import parse_query
 
 logger = logging.getLogger(__name__)
@@ -134,34 +136,74 @@ async def _news_for_tickers(
     return news
 
 
-async def _fts_articles(
+async def _vector_articles(
     db: AsyncSession,
-    keywords: list[str],
+    query_text: str,
     limit: int = _RESULT_LIMIT,
 ) -> list[Article]:
-    """Full-text search on article title + content via LIKE, deduped by URL."""
-    if not keywords:
-        return []
+    """Semantic search: embed the query and return nearest articles by cosine distance.
 
-    conditions = [
-        or_(
-            Article.title.ilike(f"%{kw}%"),
-            Article.content.ilike(f"%{kw}%"),
-        )
-        for kw in keywords
-    ]
-    # DISTINCT ON url so the same article ingested under multiple ids appears once.
+    Falls back to ILIKE FTS when no articles have embeddings yet (cold-start).
+    """
+    query_vec = await embed_query(query_text)
+
+    # Cosine distance: lower = more similar. Deduped by URL via DISTINCT ON.
     stmt = (
         select(Article)
-        .where(or_(*conditions))
+        .where(Article.embedding.is_not(None))
         .distinct(Article.url)
-        .order_by(Article.url, Article.id.desc(), Article.timestamp.desc())
-        .limit(limit)
+        .order_by(
+            Article.url,
+            Article.embedding.cosine_distance(query_vec),
+        )
+        .limit(limit * 3)  # over-fetch before final re-sort
     )
-    articles = list((await db.execute(stmt)).scalars().all())
-    # Re-sort by timestamp desc after DISTINCT ON reordering
-    articles.sort(key=lambda a: a.timestamp, reverse=True)
-    return articles
+    rows = list((await db.execute(stmt)).scalars().all())
+
+    if not rows:
+        # Cold-start fallback: plain keyword ILIKE
+        words = [w for w in query_text.lower().split() if len(w) > 2]
+        if not words:
+            return []
+        conditions = [
+            or_(
+                Article.title.ilike(f"%{kw}%"),
+                Article.content.ilike(f"%{kw}%"),
+            )
+            for kw in words
+        ]
+        stmt_fts = (
+            select(Article)
+            .where(or_(*conditions))
+            .distinct(Article.url)
+            .order_by(Article.url, Article.id.desc(), Article.timestamp.desc())
+            .limit(limit)
+        )
+        rows = list((await db.execute(stmt_fts)).scalars().all())
+        rows.sort(key=lambda a: a.timestamp, reverse=True)
+        return rows
+
+    # Re-rank by actual cosine distance using in-Python similarity (no extra DB round-trip)
+    q = np.array(query_vec, dtype="float32")
+
+    def _cos_dist(article: Article) -> float:
+        if article.embedding is None:
+            return 2.0
+        v = np.array(article.embedding, dtype="float32")
+        dot = float(np.dot(q, v))
+        return 1.0 - dot  # normalised vectors → cosine distance
+
+    rows.sort(key=_cos_dist)
+    # Deduplicate URLs (DISTINCT ON already did this per-URL, but over-fetch may re-introduce)
+    seen_urls: set[str | None] = set()
+    deduped: list[Article] = []
+    for a in rows:
+        if a.url not in seen_urls:
+            seen_urls.add(a.url)
+            deduped.append(a)
+        if len(deduped) >= limit:
+            break
+    return deduped
 
 
 async def _trend_data_for_symbols(
@@ -281,8 +323,8 @@ async def search(
         trend_data = await _trend_data_for_symbols(db, symbols)
 
     else:
-        # news_search / general_search — FTS on articles, derive tickers from matches
-        articles = await _fts_articles(db, intent.keywords)
+        # news_search / general_search — semantic vector search, derive tickers from matches
+        articles = await _vector_articles(db, q)
         if articles:
             art_ids = [a.id for a in articles]
             mention_rows = await db.execute(

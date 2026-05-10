@@ -26,6 +26,8 @@ from app.models.article import Article
 from app.models.ticker import Ticker
 from app.models.ticker_mention import TickerMention
 from app.schemas.normalized import NormalizedItem
+from app.utils.embeddings import encode
+from app.utils.minhash_dedup import compute_minhash, is_near_duplicate, load_recent_signatures
 from app.utils.sentiment import analyze_sentiment
 
 logger = logging.getLogger(__name__)
@@ -142,8 +144,9 @@ async def run(db: AsyncSession) -> list[NormalizedItem]:
     )
     existing_urls: set[str] = {r[0] for r in existing_rows}
 
-    # Deduplicate within this batch too (same article can appear in multiple ticker feeds)
+    recent_signatures = await load_recent_signatures(db)
     seen_this_run: set[str] = set()
+    seen_sigs: list[list[int]] = list(recent_signatures)
     results: list[NormalizedItem] = []
 
     for item in candidates:
@@ -152,12 +155,19 @@ async def run(db: AsyncSession) -> list[NormalizedItem]:
             continue
         seen_this_run.add(url)
 
+        sig = compute_minhash(item.content)
+        if is_near_duplicate(sig, seen_sigs):
+            continue
+        seen_sigs.append(sig)
+
         article = Article(
             source=item.source,
             title=item.title,
             content=item.content,
             url=item.url,
             timestamp=item.timestamp,
+            minhash_signature=sig,
+            embedding=await encode(f"{item.title or ''} {item.content}"),
         )
         db.add(article)
         await db.flush()
@@ -168,6 +178,7 @@ async def run(db: AsyncSession) -> list[NormalizedItem]:
                     ticker=symbol,
                     article_id=article.id,
                     sentiment=item.sentiment,
+                    source_weight=0.85,
                 )
             )
 

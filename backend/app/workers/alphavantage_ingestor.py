@@ -22,6 +22,8 @@ from app.models.article import Article
 from app.models.ticker import Ticker
 from app.models.ticker_mention import TickerMention
 from app.schemas.normalized import NormalizedItem
+from app.utils.embeddings import encode
+from app.utils.minhash_dedup import compute_minhash, is_near_duplicate, load_recent_signatures
 from app.utils.sentiment import analyze_sentiment
 from app.utils.ticker_extractor import extract_tickers_db
 
@@ -107,8 +109,10 @@ async def run(db: AsyncSession) -> list[NormalizedItem]:
         return []
 
     known = await _known_symbols(db)
+    recent_signatures = await load_recent_signatures(db)
     results: list[NormalizedItem] = []
     seen_urls: set[str] = set()
+    seen_sigs: list[list[int]] = list(recent_signatures)
 
     async with httpx.AsyncClient(timeout=20) as client:
         for topic in _TOPICS:
@@ -158,6 +162,11 @@ async def run(db: AsyncSession) -> list[NormalizedItem]:
 
                 item = _normalize(raw)
 
+                sig = compute_minhash(item.content)
+                if is_near_duplicate(sig, seen_sigs):
+                    continue
+                seen_sigs.append(sig)
+
                 # Merge AV-supplied tickers with DB-verified extraction on title+summary
                 db_tickers = await extract_tickers_db(
                     f"{item.title or ''} {item.content}", db
@@ -174,6 +183,8 @@ async def run(db: AsyncSession) -> list[NormalizedItem]:
                     content=item.content,
                     url=item.url,
                     timestamp=item.timestamp,
+                    minhash_signature=sig,
+                    embedding=await encode(f"{item.title or ''} {item.content}"),
                 )
                 db.add(article)
                 await db.flush()
@@ -193,6 +204,7 @@ async def run(db: AsyncSession) -> list[NormalizedItem]:
                             ticker=symbol,
                             article_id=article.id,
                             sentiment=ticker_sent,
+                            source_weight=1.0,
                         )
                     )
 

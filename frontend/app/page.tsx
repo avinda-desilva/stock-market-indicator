@@ -5,7 +5,7 @@ import { useRouter, useSearchParams } from "next/navigation";
 import toast from "react-hot-toast";
 import { RefreshCw } from "lucide-react";
 import { motion } from "framer-motion";
-import { getTrending, getTrendingSectors } from "@/lib/api";
+import { getTrending, getTrendingSectors, triggerAllIngestors } from "@/lib/api";
 import type { TrendingTicker } from "@/lib/types";
 import { HeroTickers } from "@/components/dashboard/HeroTickers";
 import { SectorNav } from "@/components/dashboard/SectorNav";
@@ -27,6 +27,7 @@ function HomeContent() {
   const [loading, setLoading] = useState(true);
   const [sectorsLoading, setSectorsLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  const [seeding, setSeeding] = useState(false);
 
   const updateUrl = useCallback((w: TimeWindow, sector: string | null) => {
     const params = new URLSearchParams();
@@ -42,6 +43,10 @@ function HomeContent() {
     try {
       const data = await getTrending(sector ?? undefined, w);
       setTickers(data);
+      if (data.length === 0) {
+        setSeeding(true);
+        triggerAllIngestors().finally(() => setSeeding(false));
+      }
     } catch {
       toast.error("Failed to load trending tickers");
     } finally {
@@ -137,8 +142,10 @@ function HomeContent() {
           </div>
         ) : tickers.length === 0 ? (
           <div className="text-center py-20 text-[#9CA3AF]">
-            <p className="text-lg mb-2">No trending tickers yet</p>
-            <p className="text-sm">Data appears once ingestion workers run.</p>
+            <p className="text-lg mb-2">No data to display</p>
+            <p className="text-sm">
+              {seeding ? "Populating data — this may take a moment…" : "No trending data for this window."}
+            </p>
           </div>
         ) : (
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">

@@ -47,6 +47,7 @@ class TickerDetailResponse(BaseModel):
     sentiment: float | None
     score: float
     spike: bool
+    gauge_sentiment_15m: float | None = None
 
 
 class TickerNewsResponse(BaseModel):

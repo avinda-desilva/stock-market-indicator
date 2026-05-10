@@ -53,11 +53,12 @@ async def _live_trending(
     cutoff = now - timedelta(hours=hours)
     cutoff_1h = now - timedelta(hours=1)
 
-    # Base filter: mentions whose article was published within the window
+    # Base filter: non-stocktwits mentions within the window
     base = (
         select(TickerMention.ticker, func.count(TickerMention.id).label("mentions"))
         .join(Article, Article.id == TickerMention.article_id)
         .where(Article.timestamp >= cutoff)
+        .where(Article.source != "stocktwits")
     )
     if sector:
         base = base.join(Ticker, Ticker.symbol == TickerMention.ticker).where(
@@ -76,12 +77,13 @@ async def _live_trending(
         select(TickerMention.ticker, func.count(TickerMention.id).label("cnt"))
         .join(Article, Article.id == TickerMention.article_id)
         .where(Article.timestamp >= cutoff_1h)
+        .where(Article.source != "stocktwits")
         .where(TickerMention.ticker.in_(list(mention_map.keys())))
         .group_by(TickerMention.ticker)
     )
     m1h_map: dict[str, int] = {r[0]: r[1] for r in m1h_rows}
 
-    # Avg sentiment
+    # Avg sentiment (all sources — stocktwits has valid sentiment scores)
     sent_rows = await db.execute(
         select(TickerMention.ticker, func.avg(TickerMention.sentiment).label("sent"))
         .join(Article, Article.id == TickerMention.article_id)
@@ -103,11 +105,12 @@ async def _live_trending(
         m1h = m1h_map.get(sym, 0)
         sent = sent_map.get(sym, 0.0)
         t = ticker_meta.get(sym)
+        # Mirror ranking_engine formula: volume-anchored with mild spike detection
         score = float(m1h * 3 + mentions * 1.5 + sent * 2)
         hourly_avg = mentions / hours if mentions else 0
         spike = hourly_avg > 0 and m1h > (hourly_avg * 2)
         if spike:
-            score *= 1.5
+            score *= 1.3
         ranked.append({
             "symbol": sym,
             "sector": (t.sector if t else None) or "Unknown",
@@ -118,6 +121,7 @@ async def _live_trending(
             "sentiment": round(sent, 4),
             "price_change_pct": 0.0,
             "spike": spike,
+            "z_score": 0.0,
         })
 
     ranked.sort(key=lambda x: x["score"], reverse=True)
@@ -143,11 +147,6 @@ async def get_trending(
             return data
 
     data = await _live_trending(db, hours, canonical_sector)
-    if not data:
-        raise HTTPException(
-            status_code=503 if sector is None else 404,
-            detail="No trending data available for this window/sector combination.",
-        )
     return data
 
 
@@ -169,11 +168,6 @@ async def get_sector_trending(
             return data
 
     data = await _live_trending(db, hours, canonical)
-    if not data:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No trending data for sector '{canonical}' in window '{window}'.",
-        )
     return data
 
 

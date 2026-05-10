@@ -117,7 +117,7 @@ function TickerContent({
     try {
       const [d, a] = await Promise.all([
         getTickerDetail(symbol, window),
-        getTickerNews(symbol, 50, window),
+        getTickerNews(symbol, undefined, window),
       ]);
       setDetail(d);
       // Preserve static identity after first successful response.
@@ -211,7 +211,7 @@ function TickerContent({
         </Link>
       </motion.div>
 
-      {/* Compact header — symbol and company name are static, only badge/mentions animate */}
+      {/* Header row — symbol, company name, badge/mentions, and time filter all on one line */}
       {initialLoading ? (
         <div className="flex items-center gap-4 mb-6">
           <div className="shimmer h-9 w-24 rounded" />
@@ -221,19 +221,19 @@ function TickerContent({
         <motion.div
           initial={{ opacity: 0, y: 6 }}
           animate={{ opacity: 1, y: 0 }}
-          className="flex flex-wrap items-center gap-3 mb-6"
+          className="flex items-center gap-4 mb-6 flex-wrap"
         >
-          {/* Static: symbol + company name — never remount */}
-          <div className="flex items-center gap-3">
-            <h1
-              className="text-3xl font-bold text-[#1A1A1A]"
-              style={{ fontFamily: "var(--font-playfair)" }}
-            >
-              {displaySymbol}
-            </h1>
-          </div>
+          {/* Symbol */}
+          <h1
+            className="text-3xl font-bold text-[#1A1A1A] shrink-0"
+            style={{ fontFamily: "var(--font-playfair)" }}
+          >
+            {displaySymbol}
+          </h1>
+
+          {/* Company name */}
           {displayCompany && (
-            <span className="text-[#6B7280] text-base">{displayCompany}</span>
+            <span className="text-[#6B7280] text-base shrink-0">{displayCompany}</span>
           )}
 
           {/* Dynamic: sentiment badge + mentions — crossfade on window change */}
@@ -254,7 +254,7 @@ function TickerContent({
               ) : (
                 <>
                   <SentimentBadge sentiment={detail.sentiment} />
-                  <div className="flex items-center gap-1.5 text-[#6B7280] ml-auto">
+                  <div className="flex items-center gap-1.5 text-[#6B7280]">
                     <Newspaper className="w-4 h-4" />
                     <span className="text-base font-semibold">{detail.mentions_24h}</span>
                     <span className="text-base font-semibold">mentions</span>
@@ -266,18 +266,13 @@ function TickerContent({
               )}
             </motion.div>
           </AnimatePresence>
+
+          {/* Time filter pushed to the right */}
+          <div className="ml-auto">
+            <TimeFilter value={activeWindow} onChange={handleWindowChange} />
+          </div>
         </motion.div>
       )}
-
-      {/* Time filter row */}
-      <motion.div
-        initial={{ opacity: 0, y: 4 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ delay: 0.04 }}
-        className="flex items-center justify-end mb-5"
-      >
-        <TimeFilter value={activeWindow} onChange={handleWindowChange} />
-      </motion.div>
 
       {/* Chart + News side by side */}
       <div className="grid grid-cols-1 lg:grid-cols-5 gap-6">

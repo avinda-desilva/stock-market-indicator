@@ -33,40 +33,44 @@ Existing tools either require expensive subscriptions, expose raw data without s
 
 ## 2. Solution Overview
 
-**Stock Market Indicator (SMI)** is a sector-based trending ticker and financial search engine. It continuously ingests articles and social posts from five distinct data sources, extracts ticker mentions via NLP, scores each ticker using a weighted recency + sentiment + spike formula, and presents a live-updating dashboard with sector filtering, time-window controls, and a full-text search engine.
+**Stock Market Indicator (SMI)** is a sector-based trending ticker and financial search engine. It continuously ingests articles and social posts from nine distinct data sources, extracts ticker mentions via FinBERT-NER, scores each ticker using a Z-score anomaly detection formula weighted by source authority, and presents a live-updating dashboard with sector filtering, time-window controls, and a semantic vector search engine.
 
 The application is organized as three cooperating systems:
 
 | # | System | Responsibility |
 |---|--------|---------------|
-| 1 | Data Pipeline | Ingest, normalize, deduplicate, and store articles; seed the ticker dictionary |
-| 2 | Backend API | Persist data, run the ranking engine, serve REST endpoints, maintain Redis cache |
-| 3 | Frontend UI | Real-time dashboard, sector navigation, ticker detail pages, search palette |
+| 1 | Data Pipeline | Ingest, normalize, MinHash deduplicate, embed, and store articles; seed the ticker dictionary |
+| 2 | Backend API | Persist data, run the Z-score ranking engine, serve REST endpoints, maintain Redis cache |
+| 3 | Frontend UI | Real-time dashboard, sector navigation, ticker detail pages, semantic search palette |
 
 ---
 
 ## 3. System Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                         External Data Sources                        │
-│  NewsAPI  │  Alpha Vantage  │  Polygon.io  │  Twitter/Reddit  │  Yahoo RSS │
-└─────┬──────────────┬──────────────┬────────────────┬────────────────┘
-      │              │              │                │
-      ▼              ▼              ▼                ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                System 1 — Data Pipeline (APScheduler)                │
-│                                                                      │
-│  news_ingestor  │  alphavantage_ingestor  │  market_ingestor         │
-│  social_ingestor  │  yahoo_rss_ingestor   │  ranking_engine          │
-│                                                                      │
-│  Normalize → Sentiment (TextBlob) → Ticker Extraction → Deduplicate  │
-└───────────────────────────────┬─────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                              External Data Sources                            │
+│  NewsAPI │ Alpha Vantage │ Polygon.io │ Twitter/Reddit │ Yahoo RSS            │
+│  Finnhub │ GDELT         │ Google News RSS             │ StockTwits           │
+└─────┬───────────────┬──────────────┬─────────────────┬────────────────────────┘
+      │               │              │                 │
+      ▼               ▼              ▼                 ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                 System 1 — Data Pipeline (APScheduler)                        │
+│                                                                               │
+│  news_ingestor │ alphavantage_ingestor │ market_ingestor │ finnhub_ingestor   │
+│  social_ingestor │ yahoo_rss_ingestor  │ gdelt_ingestor  │ googlenews_ingestor│
+│  stocktwits_ingestor │ ranking_engine                                         │
+│                                                                               │
+│  Normalize → FinBERT Sentiment → FinBERT-NER Ticker Extraction               │
+│  → MinHash Dedup → Embed (MiniLM) → Source Weight → Persist                  │
+└────────────────────────────────┬────────────────────────────────────────────┘
                                 │ SQLAlchemy async writes
                                 ▼
 ┌───────────────────────────────────────────────────────────────────┐
-│                   PostgreSQL  (smi_postgres)                       │
-│   tickers  │  articles  │  ticker_mentions                         │
+│                   PostgreSQL + pgvector  (smi_postgres)            │
+│   tickers  │  articles (minhash_signature, embedding)              │
+│   ticker_mentions (source_weight)                                  │
 └───────────────────────┬───────────────────────────────────────────┘
                         │                    ▲
                         │ ranking_engine      │ live DB queries
@@ -100,7 +104,7 @@ The data pipeline is the ingestion and scoring layer. It runs entirely within th
 
 ### 4.1 Ingestion Workers
 
-Each worker follows the same contract: accept an `AsyncSession`, fetch data from its source, normalize into a `NormalizedItem`, run sentiment analysis and ticker extraction, deduplicate by URL, persist to PostgreSQL, and commit.
+Each worker follows the same contract: accept an `AsyncSession`, fetch data from its source, normalize into a `NormalizedItem`, run FinBERT sentiment and FinBERT-NER ticker extraction, MinHash-deduplicate, generate a sentence embedding, set a source authority weight, persist to PostgreSQL, and commit.
 
 #### news_ingestor — NewsAPI
 - **Source:** `https://newsapi.org/v2/everything`
@@ -108,7 +112,8 @@ Each worker follows the same contract: accept an `AsyncSession`, fetch data from
 - **Volume:** 5 finance queries × 20 articles per query = up to 100 articles/run
 - **Queries:** `["stock market", "NYSE", "NASDAQ", "earnings", "IPO"]`
 - **Key required:** `NEWS_API_KEY`
-- **Process:** Fetches article headline + content → TextBlob sentiment → DB ticker extraction → upsert
+- **Source weight:** 0.8
+- **Process:** Fetches article headline + content → FinBERT sentiment → FinBERT-NER ticker extraction → MinHash dedup → embed → upsert
 
 #### alphavantage_ingestor — Alpha Vantage
 - **Source:** `https://www.alphavantage.co/query?function=NEWS_SENTIMENT`
@@ -116,13 +121,15 @@ Each worker follows the same contract: accept an `AsyncSession`, fetch data from
 - **Volume:** 6 sector topics × 50 articles = up to 300 articles/run (24 requests/day, within 25/day free cap)
 - **Topics:** `technology`, `finance`, `energy_transportation`, `manufacturing`, `real_estate`, `retail_wholesale`
 - **Key required:** `ALPHA_VANTAGE_API_KEY`
-- **Special behavior:** Alpha Vantage provides its own `overall_sentiment_score` and per-ticker `ticker_sentiment_score`. These float scores are preferred over TextBlob when available. The worker merges AV-supplied ticker symbols with our DB-verified ticker extractor.
+- **Source weight:** 1.0 (highest authority — pre-computed financial sentiment)
+- **Special behavior:** AV provides its own `overall_sentiment_score` and per-ticker `ticker_sentiment_score`. These float scores are preferred over FinBERT when available. The worker merges AV-supplied ticker symbols with our DB-verified NER extractor.
 
 #### market_ingestor — Polygon.io
 - **Source:** `https://api.polygon.io/v2/reference/news`
 - **Schedule:** Hourly at :00
 - **Volume:** 50 articles/run
 - **Key required:** `POLYGON_API_KEY`
+- **Source weight:** 0.9
 - **Process:** Polygon returns article-level ticker arrays; these are cross-validated against the DB ticker dictionary before being saved as `TickerMention` rows.
 
 #### social_ingestor — Twitter/X & Reddit
@@ -132,6 +139,7 @@ Each worker follows the same contract: accept an `AsyncSession`, fetch data from
 - **Schedule:** Every 15 minutes
 - **Volume:** 3 queries × 20 tweets + 4 subreddits × 25 posts
 - **Keys required:** `TWITTER_BEARER_TOKEN` (paid tier), `REDDIT_CLIENT_ID`, `REDDIT_CLIENT_SECRET`, `REDDIT_USER_AGENT`
+- **Source weight:** Reddit 0.3, Twitter 0.2 (social signals carry lower authority than curated news)
 - **Behavior:** Gracefully skips if credentials are absent. Twitter queries filter language to English and exclude retweets.
 
 #### yahoo_rss_ingestor — Yahoo Finance RSS
@@ -139,41 +147,111 @@ Each worker follows the same contract: accept an `AsyncSession`, fetch data from
 - **Schedule:** Hourly at :30
 - **Volume:** ~50 tickers × 15 items/feed = ~750 article candidates/run, minus duplicates
 - **Key required:** None (public RSS feed)
-- **Process:** Fetches all tracked ticker symbols concurrently (capped at 5 simultaneous requests via asyncio Semaphore). Parses XML with stdlib `xml.etree`. Each feed item is inherently tied to a known ticker, so no NLP extraction is needed for ticker association.
+- **Source weight:** 0.85
+- **Process:** Fetches all tracked ticker symbols concurrently (capped at 5 simultaneous requests via asyncio Semaphore). Parses XML with stdlib `xml.etree`. Each feed item is inherently tied to a known ticker, so no NER extraction is needed for ticker association.
+
+#### finnhub_ingestor — Finnhub
+- **Source:** `https://finnhub.io/api/v1/news`
+- **Schedule:** Every 30 minutes
+- **Key required:** `FINNHUB_API_KEY`
+- **Source weight:** 0.9
+- **Process:** Fetches general financial news; FinBERT-NER extracts tickers from article text. High-quality curated source, weight near Polygon.
+
+#### gdelt_ingestor — GDELT
+- **Source:** GDELT GKG / Event API
+- **Schedule:** Hourly
+- **Key required:** None (public)
+- **Source weight:** 0.75
+- **Process:** Ingests broadcast/print media events with financial relevance signals. Lower authority weight due to broad source coverage including unvetted outlets.
+
+#### googlenews_ingestor — Google News RSS
+- **Source:** `https://news.google.com/rss/search?q={query}`
+- **Schedule:** Every 30 minutes
+- **Key required:** None (public RSS)
+- **Source weight:** 0.8
+- **Process:** Finance-keyword-driven RSS feeds; FinBERT-NER ticker extraction. Comparable authority to NewsAPI.
+
+#### stocktwits_ingestor — StockTwits
+- **Source:** StockTwits stream API
+- **Schedule:** Every 15 minutes
+- **Key required:** None (public)
+- **Source weight:** 0.3
+- **Process:** Social sentiment only; FinBERT scores posts. StockTwits mentions are **excluded from all ranking mention counts** — they inflate volume without contributing to the news timeline. Used only for supplemental sentiment signal.
 
 ### 4.2 Ticker Extraction (`utils/ticker_extractor.py`)
 
-When article text needs to be scanned for ticker mentions:
-1. A regex `\$?([A-Z]{1,5})\b` finds all uppercase word tokens (with optional `$` prefix)
-2. A stopword filter removes common false positives (`A`, `I`, `AN`, `FED`, `CEO`, `ETF`, etc.)
-3. Remaining candidates are cross-referenced against the `tickers` table in PostgreSQL — only known tickers are kept
+Uses a **FinBERT-NER pipeline** (`dslim/bert-base-NER`) loaded once at startup as a module-level singleton. NER inference runs in a shared `ThreadPoolExecutor` so async callers are never blocked.
+
+**Pipeline:**
+1. Text is truncated to 1,500 chars (~512 tokens) before passing to the NER model
+2. `dslim/bert-base-NER` tags named entities; `ORG` entities are extracted as candidate ticker names
+3. Candidates are uppercased and cross-referenced against the `tickers` table in PostgreSQL — only DB-confirmed symbols are kept
+4. **Fallback:** If the NER model is unavailable (import error or OOM), the extractor falls back to regex `\$?([A-Z]{2,5})\b` + an expanded stopword filter
 
 ### 4.3 Sentiment Analysis (`utils/sentiment.py`)
 
-All text-level sentiment uses **TextBlob** polarity:
-- Returns a `float` in `[-1.0, 1.0]`
-- Applied to `"{title} {content}"` concatenation
-- Alpha Vantage articles may override this with their own pre-computed score
+All text-level sentiment uses **FinBERT** (`ProsusAI/finbert`):
+- Domain-specific financial language model; outperforms TextBlob on earnings/analyst/market text
+- Returns a `float` in `[-1.0, 1.0]`: positive confidence → positive score, negative confidence → negative score, neutral → 0.0
+- Text is pre-trimmed to 2,000 chars to bound tokenizer input
+- Exposed as both a sync (`analyze_sentiment`) and async (`analyze_sentiment_async`) interface via `asyncio.to_thread`
+- Alpha Vantage articles may still override with their own pre-computed float score
 
 ### 4.4 Deduplication
 
-All workers deduplicate by `Article.url` before inserting. The pattern is:
-1. Collect candidate URLs in the current batch
-2. Query `SELECT url FROM articles WHERE url IN (...)` in one round trip
-3. Skip any URL already present; also skip within-batch duplicates via `seen_urls` set
+Two-layer deduplication strategy:
 
-### 4.5 Ranking Engine
+**Layer 1 — Exact URL match** (unchanged):
+1. Collect candidate URLs in the current batch
+2. `SELECT url FROM articles WHERE url IN (...)` in one round trip
+3. Skip exact-URL duplicates and within-batch duplicates via `seen_urls` set
+
+**Layer 2 — MinHash/LSH near-duplicate detection** (`utils/minhash_dedup.py`):
+1. Compute a **128-permutation MinHash** signature from 3-gram word shingles of the article content
+2. Load signatures of all articles ingested within the last 24 hours from `articles.minhash_signature` (JSONB column)
+3. Estimate **Jaccard similarity** between the candidate and each recent signature
+4. If any similarity ≥ **0.85**, the article is treated as a near-duplicate and skipped — catches syndicated copies, paraphrase rewrites, and RSS/API source overlap
+5. The MinHash signature is stored in `articles.minhash_signature` (JSONB array of 128 integers)
+
+**Tuning constants:** `NUM_PERM=128`, `SIMILARITY_THRESHOLD=0.85`, `DEDUP_WINDOW_HOURS=24`, `MIN_CONTENT_TOKENS=5`
+
+### 4.4a Vector Embeddings (`utils/embeddings.py`)
+
+After deduplication, each article's `"{title} {content}"` is encoded into a **384-dimensional unit-normalised embedding vector** using `sentence-transformers/all-MiniLM-L6-v2`:
+- Model loaded once as a module-level singleton via `@lru_cache`
+- Inference runs in a dedicated `ThreadPoolExecutor` (2 workers) so the asyncio loop is never blocked
+- Vectors stored in `articles.embedding` (pgvector `VECTOR(384)` column)
+- Used by the search router for cosine-distance semantic retrieval
+
+### 4.5 Source Authority Matrix
+
+Each `TickerMention` row carries a `source_weight` float (0.0–1.0) set by the ingestor at write time. The ranking engine uses these weights to compute a **weighted-average sentiment** rather than a simple mean, so high-authority sources (Alpha Vantage, Polygon, Finnhub) exert more influence on a ticker's sentiment score than social feeds.
+
+| Source | Weight | Rationale |
+|--------|--------|-----------|
+| Alpha Vantage | 1.0 | Pre-computed financial NLP, curated feed |
+| Polygon.io | 0.9 | Professional market data provider |
+| Finnhub | 0.9 | Curated financial news |
+| Yahoo Finance RSS | 0.85 | Reputable financial outlet, per-ticker feed |
+| NewsAPI | 0.8 | General news — quality varies by outlet |
+| Google News RSS | 0.8 | Broad aggregator — quality varies |
+| GDELT | 0.75 | Broadcast/print; includes unvetted sources |
+| Reddit | 0.3 | Social opinion — low editorial control |
+| StockTwits | 0.3 | Social sentiment only |
+| Twitter/X | 0.2 | Noisiest signal; unfiltered public posts |
+
+### 4.6 Ranking Engine
 
 - **Schedule:** Every minute
 - **Storage:** Redis keys `trending:global` and `trending:{Sector}`, TTL = 90 seconds
 
 The ranking engine scores every ticker in the database each minute and writes the results to Redis. See [Section 11](#11-ranking-algorithm) for the formula.
 
-### 4.6 Nightly Cleanup
+### 4.7 Nightly Cleanup
 
 A cleanup job runs at 23:59 UTC daily. It deletes `Article` rows (and cascades to `TickerMention`) older than 7 days, keeping the database from growing unbounded.
 
-### 4.7 One-Shot Seed Pipeline (`smi_pipeline` container)
+### 4.8 One-Shot Seed Pipeline (`smi_pipeline` container)
 
 On startup, a separate Docker container (`smi_pipeline`) runs `data-pipeline/run_ingestors.py all`. This triggers all five ingestors once in sequence to pre-populate the database before any user loads the dashboard. The container exits after completion (`restart: "no"`).
 
@@ -237,17 +315,17 @@ All trending endpoints accept `?window=6h|24h|3d|7d` (default `24h`). The Redis 
 | Model | Table | Key Columns |
 |-------|-------|-------------|
 | `Ticker` | `tickers` | `symbol` (PK), `company_name`, `sector` |
-| `Article` | `articles` | `id`, `source`, `title`, `content`, `url`, `timestamp` |
-| `TickerMention` | `ticker_mentions` | `id`, `ticker` (FK → tickers), `article_id` (FK → articles), `sentiment` |
+| `Article` | `articles` | `id`, `source`, `title`, `content`, `url`, `timestamp`, `minhash_signature` (JSONB), `embedding` (Vector 384) |
+| `TickerMention` | `ticker_mentions` | `id`, `ticker` (FK → tickers), `article_id` (FK → articles), `sentiment`, `source_weight` |
 
 Time-window queries always filter on `Article.timestamp` (publication time), not `TickerMention.created_at` (ingestion time). This ensures that a 6-hour window reflects when news was published, not when SMI happened to process it.
 
-### 5.4 Database — PostgreSQL
+### 5.4 Database — PostgreSQL + pgvector
 
-- Image: `postgres:15-alpine`
+- Image: `postgres:15-alpine` + `pgvector` extension
 - Async driver: `asyncpg`
 - ORM: SQLAlchemy 2.0 (async session pattern)
-- Migrations: Alembic (`app/migrations/versions/0001_initial_schema.py`)
+- Migrations: Alembic (`0001_initial_schema` → `0002_add_minhash_signature` → `0003_add_source_weight_to_ticker_mentions` → `0004_add_vector_embeddings`)
 - Persistence: Docker named volume `postgres_data`
 
 ### 5.5 Cache — Redis
@@ -268,6 +346,10 @@ Time-window queries always filter on `Article.timestamp` (publication time), not
 | `market_ingestor` | `0 * * * *` | `_run_market()` |
 | `alphavantage_ingestor` | `0 */6 * * *` | `_run_alphavantage()` |
 | `yahoo_rss_ingestor` | `30 * * * *` | `_run_yahoo_rss()` |
+| `finnhub_ingestor` | `*/30 * * * *` | `_run_finnhub()` |
+| `gdelt_ingestor` | `0 * * * *` | `_run_gdelt()` |
+| `googlenews_ingestor` | `*/30 * * * *` | `_run_googlenews()` |
+| `stocktwits_ingestor` | `*/15 * * * *` | `_run_stocktwits()` |
 | `ranking_engine` | `* * * * *` | `_run_ranking()` |
 | `cleanup` | `59 23 * * *` | `_run_cleanup()` |
 
@@ -333,11 +415,14 @@ Typed fetch functions:
 | SQLAlchemy | 2.0.41 | Async ORM |
 | asyncpg | 0.30.0 | PostgreSQL async driver |
 | Alembic | 1.15.2 | Database migrations |
+| pgvector | 0.3.x | PostgreSQL vector similarity extension + SQLAlchemy type |
 | Redis (redis.asyncio) | 5.2.1 | Async Redis client |
 | Pydantic | 2.11.4 | Data validation + settings |
 | pydantic-settings | 2.9.1 | `.env` config management |
 | httpx | 0.28.1 | Async HTTP client for external APIs |
-| TextBlob | 0.19.0 | NLP sentiment analysis |
+| transformers | 4.x | FinBERT sentiment (`ProsusAI/finbert`) + FinBERT-NER (`dslim/bert-base-NER`) |
+| sentence-transformers | 3.x | `all-MiniLM-L6-v2` 384-dim embeddings |
+| datasketch | 1.6.x | MinHash / LSH near-duplicate detection |
 | APScheduler | 3.11.0 | In-process async cron scheduler |
 | newsapi-python | 0.2.7 | NewsAPI SDK |
 | PRAW | 7.8.1 | Reddit API client |
@@ -360,7 +445,7 @@ Typed fetch functions:
 ### Infrastructure
 | Component | Technology | Version |
 |-----------|-----------|---------|
-| Database | PostgreSQL | 15-alpine |
+| Database | PostgreSQL + pgvector | 15-alpine |
 | Cache | Redis | 7-alpine |
 | Containerization | Docker + Docker Compose | v3.9 |
 | Container orchestration | Docker Compose | — |
@@ -409,8 +494,31 @@ Typed fetch functions:
 - **No API key required**
 - **Endpoint:** `https://feeds.finance.yahoo.com/rss/2.0/headline?s={SYMBOL}`
 - **What it provides:** Public per-ticker RSS news feeds (headline, link, description, publication date)
-- **How it's used:** All ticker symbols in the DB are iterated. Feeds are fetched concurrently (max 5 simultaneous). Since the feed is per-ticker, no NLP ticker extraction is needed — the ticker is known from the feed URL. Each item's headline + description is TextBlob-scored.
+- **How it's used:** All ticker symbols in the DB are iterated. Feeds are fetched concurrently (max 5 simultaneous). Since the feed is per-ticker, no NER extraction is needed — the ticker is known from the feed URL. Each item's headline + description is FinBERT-scored.
 - **Volume:** ~50 tickers × 15 items = ~750 candidates/run (after deduplication, much less)
+
+### Finnhub
+- **Variable:** `FINNHUB_API_KEY`
+- **Endpoint:** `https://finnhub.io/api/v1/news`
+- **What it provides:** Curated financial news with company coverage
+- **How it's used:** Fetched every 30 minutes; FinBERT-NER extracts ticker mentions from article text. High source weight (0.9) due to curated feed quality.
+- **Rate limit:** Free tier: 60 API calls/minute
+
+### GDELT
+- **No API key required**
+- **What it provides:** Global news event database including broadcast, print, and web media with financial relevance signals
+- **How it's used:** Fetched hourly; lower source weight (0.75) due to broad, unvetted source coverage. FinBERT-NER extracts tickers.
+
+### Google News RSS
+- **No API key required**
+- **Endpoint:** `https://news.google.com/rss/search?q={query}`
+- **What it provides:** Aggregated financial news from diverse outlets
+- **How it's used:** Finance-keyword-driven RSS queries every 30 minutes; FinBERT-NER ticker extraction.
+
+### StockTwits
+- **No API key required (public stream)**
+- **What it provides:** Real-time social sentiment from retail investors; posts are typically short, ticker-tagged messages
+- **How it's used:** Fetched every 15 minutes. FinBERT scores posts. **Excluded from all ranking mention counts** to prevent social volume inflation; used only for supplemental weighted sentiment signal. Source weight: 0.3.
 
 ---
 
@@ -436,62 +544,71 @@ This section traces the full lifecycle of a single article from external API to 
    }
 
 3. SENTIMENT
-   analyze_sentiment("{title} {content}")
-   → TextBlob("{title} {content}").sentiment.polarity
-   → 0.42  ← stored in NormalizedItem.sentiment
+   analyze_sentiment_async("{title} {content}")
+   → FinBERT("ProsusAI/finbert") → label="positive", confidence=0.91
+   → polarity = +0.91  ← stored in NormalizedItem.sentiment
 
 4. TICKER EXTRACTION
    extract_tickers_db("Apple beats Q3 earnings expectations Apple Inc. reported...", db)
-   → regex finds ["APPLE", "Q", "INC"]
-   → stopword filter removes ["Q", "INC"]
+   → dslim/bert-base-NER tags: [("Apple", ORG), ("Apple Inc.", ORG)]
+   → candidates uppercased: ["APPLE"]
    → DB lookup: SELECT symbol FROM tickers WHERE symbol IN ('APPLE')
    → cross-reference returns []  (no match for "APPLE")
-   → separately regex finds "AAPL" if present in text
+   → separately NER / regex finds "AAPL" if present in text
    → returns ["AAPL"]
 
-5. DEDUPLICATE
+5. DEDUPLICATE — Layer 1 (exact URL)
    SELECT url FROM articles WHERE url = 'https://...'
-   → empty result → not a duplicate, proceed
+   → empty result → not an exact duplicate, continue
 
-6. PERSIST
-   INSERT INTO articles (source, title, content, url, timestamp) VALUES (...)
+   DEDUPLICATE — Layer 2 (MinHash/LSH)
+   sig = compute_minhash("{title} {content}")  # 128-perm MinHash on 3-gram shingles
+   recent_sigs = await load_recent_signatures(db)  # last 24 h
+   is_near_duplicate(sig, recent_sigs, threshold=0.85) → False → proceed
+
+6. EMBED
+   embedding = await encode("{title} {content}")
+   → all-MiniLM-L6-v2 → 384-dim unit-normalised vector
+
+7. PERSIST
+   INSERT INTO articles (source, title, content, url, timestamp, minhash_signature, embedding)
+   VALUES (..., [sig_ints], [vec_floats])
    → article.id = 9821
 
-   INSERT INTO ticker_mentions (ticker, article_id, sentiment)
-   VALUES ('AAPL', 9821, 0.42)
+   INSERT INTO ticker_mentions (ticker, article_id, sentiment, source_weight)
+   VALUES ('AAPL', 9821, 0.91, 0.8)  ← source_weight=0.8 for newsapi
 
-7. COMMIT
+8. COMMIT
    db.commit()
 
-8. RANKING ENGINE (runs every minute)
-   SELECT ticker, COUNT(*) FROM ticker_mentions
-     JOIN articles ON articles.id = ticker_mentions.article_id
-     WHERE articles.timestamp >= NOW() - INTERVAL '1 hour'
-     GROUP BY ticker
-   → mentions_1h: {AAPL: 14, TSLA: 8, NVDA: 21, ...}
+9. RANKING ENGINE (runs every minute)
+   Z-score SQL CTE:
+   - Bucket TickerMentions into 1h slots over the last 7 days (excluding stocktwits)
+   - Compute per-ticker μ and σ across those hourly buckets
+   - Isolate the current hour bucket → mentions_1h
+   - Compute z_score = (mentions_1h - μ) / σ
 
-   SELECT ticker, COUNT(*) FROM ticker_mentions ... WHERE >= NOW() - 24h
-   → mentions_24h: {AAPL: 87, TSLA: 55, NVDA: 143, ...}
+   → z_score(NVDA) = (21 - 5.96) / 7.5 = 2.01
 
-   SELECT ticker, AVG(sentiment) FROM ticker_mentions ... WHERE >= NOW() - 24h
-   → sentiment_24h: {AAPL: 0.31, TSLA: -0.12, NVDA: 0.58, ...}
+   Weighted sentiment:
+   → weighted_sentiment(NVDA) = SUM(sentiment × source_weight) / SUM(source_weight)
+                               = 0.58 (over last 24 h)
 
-   score(NVDA) = (21 × 3) + (143 × 1.5) + (0.58 × 2) + (0.0 × 2)
-              = 63 + 214.5 + 1.16 + 0
-              = 278.66
+   score(NVDA) = (2.01 × 2) + (143 × 0.15) + (0.58 × 2) + (0.0 × 2)
+              = 4.02 + 21.45 + 1.16 + 0
+              = 26.63
 
-   spike_check: hourly_avg = 143/24 = 5.96
-                21 > 5.96 × 2 = 11.92  → TRUE → spike boost
-   score(NVDA) = 278.66 × 1.5 = 417.99
+   spike_check: z_score 2.01 ≥ 2.0 → spike boost
+   score(NVDA) = 26.63 × 1.3 = 34.62
 
-9. REDIS WRITE
-   SET trending:global '[{"symbol":"NVDA","score":417.99,...}, ...]'  EX 90
-   SET trending:Technology '[{"symbol":"NVDA","score":417.99,...}, ...]'  EX 90
+10. REDIS WRITE
+    SET trending:global '[{"symbol":"NVDA","score":34.62,"z_score":2.01,"spike":true,...}, ...]' EX 90
+    SET trending:Technology '[{"symbol":"NVDA","score":34.62,...}, ...]'  EX 90
 
-10. API SERVE
+11. API SERVE
     GET /trending → reads trending:global from Redis → returns JSON array
 
-11. FRONTEND RENDER
+12. FRONTEND RENDER
     Axios GET /trending → React state update → TickerCard grid re-renders
     NVDA shows score bar at 100% of maxScore, spike badge visible
 ```
@@ -511,11 +628,14 @@ This section traces the full lifecycle of a single article from external API to 
 | Column | Type | Notes |
 |--------|------|-------|
 | `id` | INTEGER (PK, auto) | |
-| `source` | VARCHAR | `newsapi`, `alphavantage`, `polygon`, `twitter`, `reddit`, `yahoo_rss` |
+| `source` | VARCHAR | `newsapi`, `alphavantage`, `polygon`, `twitter`, `reddit`, `yahoo_rss`, `finnhub`, `gdelt`, `googlenews`, `stocktwits` |
 | `title` | TEXT | Nullable |
 | `content` | TEXT | Body or description |
-| `url` | TEXT (UNIQUE) | Deduplication key |
+| `url` | TEXT (UNIQUE) | Exact-match deduplication key |
 | `timestamp` | TIMESTAMPTZ | Publication time (used for all window filters) |
+| `created_at` | TIMESTAMPTZ | Ingestion time (not used for window filters) |
+| `minhash_signature` | JSONB | 128-integer MinHash signature for near-duplicate detection |
+| `embedding` | VECTOR(384) | all-MiniLM-L6-v2 unit-normalised embedding for semantic search |
 
 ### `ticker_mentions`
 | Column | Type | Notes |
@@ -523,7 +643,9 @@ This section traces the full lifecycle of a single article from external API to 
 | `id` | INTEGER (PK, auto) | |
 | `ticker` | VARCHAR (FK → tickers.symbol) | |
 | `article_id` | INTEGER (FK → articles.id, CASCADE DELETE) | |
-| `sentiment` | FLOAT | Polarity score in `[-1.0, 1.0]` |
+| `sentiment` | FLOAT | FinBERT polarity score in `[-1.0, 1.0]` |
+| `source_weight` | FLOAT | Authority weight set by ingestor (0.0–1.0); default 1.0 |
+| `created_at` | TIMESTAMPTZ | Ingestion time |
 
 > **Design note:** `Article.timestamp` is the article's publication time. `TickerMention.created_at` (ingestion time) is intentionally excluded from all window-filter queries. This means the `24h` window shows articles *published* in the last 24 hours, not articles *ingested* in that period.
 
@@ -531,34 +653,50 @@ This section traces the full lifecycle of a single article from external API to 
 
 ## 11. Ranking Algorithm
 
-The ranking engine runs every minute. For each ticker in the database:
+The ranking engine runs every minute and uses **Z-score anomaly detection** to surface relative spikes rather than raw volume. All mention counts exclude StockTwits articles.
+
+### 11.1 Z-Score Calculation
+
+A PostgreSQL CTE buckets all non-StockTwits `TickerMention` rows into 1-hour slots over the last 7 days, computes per-ticker `μ` (mean hourly mentions) and `σ` (standard deviation), then derives the current hour's Z-score:
 
 ```
-score = (mentions_1h × 3) + (mentions_24h × 1.5) + (sentiment_24h × 2) + (price_change_pct × 2)
+z_score = (mentions_1h − μ_hourly) / σ_hourly
 ```
 
-**Spike boost:** If the last hour's mention count exceeds twice the rolling hourly average:
+Falls back to 0.0 when `σ = 0` or the ticker has no 7-day history.
+
+### 11.2 Score Formula
+
 ```
-if mentions_1h > (mentions_24h / 24) × 2:
-    score = score × 1.5
+weighted_sentiment = SUM(sentiment × source_weight) / SUM(source_weight)  [last 24 h]
+
+score = (z_score × 2) + (mentions_24h × 0.15) + (weighted_sentiment × 2) + (price_change_pct × 2)
+```
+
+**Spike boost:** If `z_score ≥ 2.0` (2 σ above mean):
+```
+score = score × 1.3
 ```
 
 **Weight rationale:**
-- `mentions_1h × 3` — highest weight; recent velocity is the strongest trending signal
-- `mentions_24h × 1.5` — provides volume context and prevents one-article spikes from dominating
-- `sentiment × 2` — positive sentiment lifts score; negative suppresses it
-- `price_change_pct × 2` — reserved for future integration with market data (currently defaults to 0.0)
+- `z_score × 2` — primary signal; detects relative velocity spikes even for low-volume tickers
+- `mentions_24h × 0.15` — volume anchor; keeps established high-mention tickers visible during quiet hours
+- `weighted_sentiment × 2` — source-authority-weighted sentiment lifts/suppresses score
+- `price_change_pct × 2` — reserved for market data integration (currently 0.0)
+- Spike threshold of 2.0 σ with a conservative 1.3× boost (reduced from 1.5× to avoid over-amplification)
 
-**Output:**
+**Output per ranked ticker:** `{symbol, sector, company_name, score, mentions_1h, mentions_24h, sentiment, price_change_pct, z_score, spike}`
+
+**Redis keys:**
 - `trending:global` — top-10 across all sectors, sorted by score descending
-- `trending:{Sector}` — top-10 per sector (e.g. `trending:Technology`, `trending:Energy`)
-- Each key expires in **90 seconds**, so stale scores are never served for more than 90s after the ranking engine updates them
+- `trending:{Sector}` — top-10 per sector (e.g. `trending:Technology`)
+- TTL: **90 seconds** per key
 
 ---
 
 ## 12. Search Query Pipeline
 
-The search system (`utils/query_pipeline.py` + `routers/search.py`) processes free-text queries into typed, intent-driven responses.
+The search system (`utils/query_pipeline.py` + `routers/search.py`) processes free-text queries into typed, intent-driven responses. News retrieval uses **semantic vector search** backed by pgvector.
 
 ### Intent Classification
 
@@ -575,8 +713,16 @@ Input: raw query string
 |--------|---------------|----------------|
 | `sector_search` | "AI stocks", "biotech" | Filter trending results by matched sector |
 | `ticker_lookup` | "AAPL", "$TSLA" | Return ticker profile + trend data directly |
-| `news_search` | "earnings report", "beat estimates" | Full-text search on article titles/content |
-| `general_search` | "cloud computing growth" | `ILIKE` FTS across tickers and articles |
+| `news_search` | "earnings report", "beat estimates" | Semantic cosine search on article embeddings |
+| `general_search` | "cloud computing growth" | Semantic cosine search; ILIKE FTS fallback on cold start |
+
+### Semantic Search (`_vector_articles`)
+
+For `news_search` and `general_search` intents:
+1. The query string is encoded with `all-MiniLM-L6-v2` via `utils/embeddings.encode()`
+2. pgvector cosine distance query retrieves nearest articles: `ORDER BY embedding <=> query_vec`
+3. Articles without embeddings (cold-start) fall through to an `ILIKE` keyword fallback
+4. Results are de-duplicated by URL via `DISTINCT ON` before final re-sort
 
 ### Response Schema
 
@@ -680,4 +826,4 @@ gunzip -c backups/smi_<timestamp>.sql.gz | \
 
 ---
 
-*Document generated: 2026-05-04 | Version: 0.2.0 | Stage: 5 of 6 complete*
+*Document updated: 2026-05-10 | Version: 0.3.0 | Stage: 6 (v2 features) complete*
