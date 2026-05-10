@@ -303,6 +303,7 @@ function TickerContent({
               externalHoverTs={newsHoverTs}
               highlightedArticleUrl={highlightedArticleUrl}
               transitioning={transitioning || initialLoading}
+              domainMax={articleTsMap.length ? articleTsMap[articleTsMap.length - 1][0] : undefined}
             />
           )}
         </motion.div>

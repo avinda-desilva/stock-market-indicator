@@ -31,6 +31,9 @@ interface Props {
   onHoverArticle?: (articleId: number | null) => void;
   highlightedArticleUrl?: string | null;
   transitioning?: boolean;
+  // Optional explicit domain max — extends chart x-axis beyond last bucket start
+  // so article timestamps near the right edge aren't clamped to it.
+  domainMax?: number;
 }
 
 function formatMs(ms: number): { time: string; date: string } {
@@ -141,6 +144,7 @@ export function SentimentChart({
   onHoverArticle,
   highlightedArticleUrl,
   transitioning = false,
+  domainMax,
 }: Props) {
   const [hover, setHover] = useState<HoverState | null>(null);
   const suppressOverlay = useRef(false);
@@ -194,16 +198,19 @@ export function SentimentChart({
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Chart domain is always the bucket range — this keeps the area filling edge-to-edge.
-  // Article timestamps are used only for hover mapping and axis labels.
+  // Chart domain spans from the earliest bucket to the latest article timestamp (or domainMax).
+  // This ensures article timestamps near the end of the window aren't clamped to the last bucket start.
   const bucketTimestamps = displayData.map((d) => d.ts);
   const minTs = bucketTimestamps.length ? Math.min(...bucketTimestamps) : 0;
-  const maxTs = bucketTimestamps.length ? Math.max(...bucketTimestamps) : 1;
+  const bucketMaxTs = bucketTimestamps.length ? Math.max(...bucketTimestamps) : 1;
 
-  // Label bounds: use actual article timestamps so the start/end labels reflect real news time.
+  // Extend domain right bound to cover actual article timestamps so hover lines place correctly.
   const articleTsList = displayMap && displayMap.length ? displayMap.map(([ts]) => ts) : bucketTimestamps;
   const labelMinTs = articleTsList.length ? Math.min(...articleTsList) : minTs;
-  const labelMaxTs = articleTsList.length ? Math.max(...articleTsList) : maxTs;
+  const labelMaxTs = articleTsList.length ? Math.max(...articleTsList) : bucketMaxTs;
+  const maxTs = domainMax != null
+    ? Math.max(bucketMaxTs, domainMax)
+    : Math.max(bucketMaxTs, labelMaxTs);
 
   // Fallback article map from bucket data when fine-grained map isn't supplied.
   const resolvedMap: [number, number][] = displayMap && displayMap.length
@@ -284,8 +291,20 @@ export function SentimentChart({
   const hideStart = activeRatio !== null && activeRatio < COLLISION_THRESHOLD / plotPx;
   const hideEnd = activeRatio !== null && activeRatio > 1 - COLLISION_THRESHOLD / plotPx;
 
+  // If the domain extends past the last bucket (because a recent article timestamp
+  // is newer than the last bucket start), pad a synthetic point at maxTs so the
+  // line reaches the right edge instead of stopping at the last bucket.
+  const lastBucket = displayData[displayData.length - 1];
+  const paddedData =
+    lastBucket && maxTs > lastBucket.ts
+      ? [
+          ...displayData,
+          { ...lastBucket, ts: maxTs, time: formatShort(maxTs) },
+        ]
+      : displayData;
+
   const domain: [number, number] = [minTs, maxTs];
-  const { zeroFraction } = buildGradientStops(displayData);
+  const { zeroFraction } = buildGradientStops(paddedData);
   const zeroPct = `${(zeroFraction * 100).toFixed(1)}%`;
   const startLabel = formatMs(labelMinTs);
   const endLabel = formatMs(labelMaxTs);
@@ -369,7 +388,7 @@ export function SentimentChart({
           style={{ outline: "none" }}
         >
           <ResponsiveContainer width="100%" height={200}>
-            <AreaChart data={displayData} margin={{ top: 10, right: RIGHT_MARGIN, left: -16, bottom: 0 }}>
+            <AreaChart data={paddedData} margin={{ top: 10, right: RIGHT_MARGIN, left: -16, bottom: 0 }}>
               <defs>
                 <linearGradient id="sentStroke" x1="0" y1="0" x2="0" y2="1">
                   <stop offset="0%" stopColor="#16A34A" />
