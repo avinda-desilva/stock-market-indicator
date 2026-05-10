@@ -2,7 +2,7 @@ version: "3.9"
 
 services:
   postgres:
-    image: postgres:15-alpine
+    image: pgvector/pgvector:pg15
     container_name: smi_postgres
     restart: unless-stopped
     environment:
@@ -50,6 +50,7 @@ services:
         condition: service_healthy
     volumes:
       - ./backend:/app
+      - hf_cache:/root/.cache/huggingface
 
   data-pipeline:
     build:
@@ -65,6 +66,7 @@ services:
     volumes:
       - ./data-pipeline:/pipeline
       - ./backend:/app
+      - hf_cache:/root/.cache/huggingface
 
   frontend:
     build:
@@ -85,3 +87,4 @@ services:
 volumes:
   postgres_data:
   redis_data:
+  hf_cache:

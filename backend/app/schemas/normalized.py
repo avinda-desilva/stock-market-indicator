@@ -14,5 +14,5 @@ class NormalizedItem(BaseModel):
     url: str | None = None
     tickers: list[str] = Field(default_factory=list, description="Extracted ticker symbols")
     sentiment: float | None = Field(
-        default=None, description="TextBlob polarity in [-1.0, 1.0]"
+        default=None, description="FinBERT polarity in [-1.0, 1.0]"
     )

@@ -8,8 +8,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Download TextBlob corpora at build time
-RUN python -m textblob.download_corpora
+# Pre-download FinBERT model weights at build time so the first request doesn't block
+RUN python -c "from transformers import pipeline; pipeline('text-classification', model='ProsusAI/finbert')"
 
 COPY . .
 

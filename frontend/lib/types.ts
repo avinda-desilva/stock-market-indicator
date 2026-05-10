@@ -18,6 +18,7 @@ export interface TickerDetail {
   sentiment: number;
   score: number;
   spike: boolean;
+  gauge_sentiment_15m: number | null;
 }
 
 export interface Article {

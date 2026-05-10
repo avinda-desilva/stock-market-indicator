@@ -16,6 +16,8 @@ class Settings(BaseSettings):
     alpha_vantage_api_key: str = ""
     polygon_api_key: str = ""
 
+    finnhub_api_key: str = ""
+
     reddit_client_id: str = ""
     reddit_client_secret: str = ""
     reddit_user_agent: str = "stock-market-indicator/1.0"

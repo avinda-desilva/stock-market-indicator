@@ -15,7 +15,7 @@ Sector-Based Trending Ticker & Financial Search Engine. Monorepo with a Next.js 
 │   ├── components/
 │   │   ├── dashboard/          # HeroTickers, Navbar, NewsTimeline, SearchPalette,
 │   │   │                       # SectorNav, SentimentChart, TickerCard
-│   │   └── ui/                 # SentimentBadge, SkeletonCard, Sparkline, TimeFilter
+│   │   └── ui/                 # SentimentBadge, SentimentGauge, SkeletonCard, Sparkline, TimeFilter
 │   ├── lib/
 │   │   ├── api.ts              # Axios client + typed fetch functions
 │   │   └── types.ts            # TrendingTicker, TickerDetail, Article, SearchResult
@@ -27,13 +27,15 @@ Sector-Based Trending Ticker & Financial Search Engine. Monorepo with a Next.js 
 │   │   ├── config.py
 │   │   ├── database.py
 │   │   ├── scheduler.py
-│   │   ├── models/            # Article, Ticker, TickerMention
+│   │   ├── models/            # Article (+ minhash_signature, embedding), Ticker, TickerMention (+ source_weight)
 │   │   ├── schemas/           # normalized.py, ticker.py, article.py, search.py
 │   │   ├── routers/           # ingestors.py, tickers.py, trending.py, search.py, ticker_detail.py
 │   │   ├── workers/           # news_ingestor, social_ingestor, market_ingestor,
-│   │   │                      # alphavantage_ingestor, yahoo_rss_ingestor, ranking_engine
-│   │   ├── utils/             # ticker_extractor.py, sentiment.py, query_pipeline.py
-│   │   └── migrations/        # Alembic env + versions/0001_initial_schema
+│   │   │                      # alphavantage_ingestor, yahoo_rss_ingestor, ranking_engine,
+│   │   │                      # finnhub_ingestor, gdelt_ingestor, googlenews_ingestor, stocktwits_ingestor
+│   │   ├── utils/             # ticker_extractor.py (FinBERT-NER), sentiment.py (FinBERT),
+│   │   │                      # embeddings.py (MiniLM), minhash_dedup.py, query_pipeline.py
+│   │   └── migrations/        # Alembic env + versions/0001–0004
 │   ├── requirements.txt
 │   ├── Dockerfile
 │   └── alembic.ini
@@ -98,13 +100,14 @@ docker compose down && docker compose up -d --build
 | Table | Key Columns |
 |---|---|
 | `tickers` | `symbol` (PK), `sector`, `company_name` |
-| `articles` | `id`, `source`, `title`, `content`, `url`, `timestamp` |
-| `ticker_mentions` | `id`, `ticker` (FK→tickers), `article_id` (FK→articles), `sentiment` |
+| `articles` | `id`, `source`, `title`, `content`, `url`, `timestamp`, `minhash_signature` (JSONB), `embedding` (vector 384) |
+| `ticker_mentions` | `id`, `ticker` (FK→tickers), `article_id` (FK→articles), `sentiment`, `source_weight` |
 
 > Time-window queries must filter on `Article.timestamp` (publication time), not `TickerMention.created_at` (ingestion time).
 
-Migration: `app/migrations/versions/0001_initial_schema.py`  
-Stamp after first run: `docker exec -it smi_backend alembic stamp head`
+Migrations (run in order): `0001_initial_schema` → `0002_add_minhash_signature` → `0003_add_source_weight_to_ticker_mentions` → `0004_add_vector_embeddings`  
+Stamp after first run: `docker exec -it smi_backend alembic stamp head`  
+Apply pending: `docker exec -it smi_backend alembic upgrade head`
 
 ## API Endpoints
 
@@ -156,28 +159,37 @@ Classifies query into one of four intents:
 Returns `SearchResponse`: `{ query, intent, tickers[{symbol, score, mentions_24h, sentiment}], news[{id, source, title, url, timestamp, sentiment}], trend_data[{symbol, mentions_1h, mentions_24h, sentiment, score, spike}] }`
 
 ## Ingestion Workers
-| Worker | Source | Cron Schedule | Notes |
-|---|---|---|---|
-| `news_ingestor` | NewsAPI | every 30 min | 5 finance queries × 20 articles |
-| `social_ingestor` | Reddit + Twitter | every 15 min | skips if no credentials |
-| `market_ingestor` | Polygon.io | hourly :00 | 50 articles/run |
-| `alphavantage_ingestor` | Alpha Vantage | every 6 h | 6 topics × 50; 24 req/day (free cap = 25) |
-| `yahoo_rss_ingestor` | Yahoo Finance RSS | hourly :30 | per-ticker RSS, no key, ~500 articles/run |
-| `ranking_engine` | — | every minute | scores tickers → Redis TTL 90 s |
+| Worker | Source | Cron Schedule | Source Weight | Notes |
+|---|---|---|---|---|
+| `news_ingestor` | NewsAPI | every 30 min | 0.8 | 5 finance queries × 20 articles |
+| `social_ingestor` | Reddit / Twitter | every 15 min | Reddit 0.3, Twitter 0.2 | skips if no credentials |
+| `market_ingestor` | Polygon.io | hourly :00 | 0.9 | 50 articles/run |
+| `alphavantage_ingestor` | Alpha Vantage | every 6 h | 1.0 | 6 topics × 50; 24 req/day (free cap = 25) |
+| `yahoo_rss_ingestor` | Yahoo Finance RSS | hourly :30 | 0.85 | per-ticker RSS, no key, ~500 articles/run |
+| `finnhub_ingestor` | Finnhub | every 30 min | 0.9 | financial news + company NER |
+| `gdelt_ingestor` | GDELT | hourly | 0.75 | broadcast/print media events |
+| `googlenews_ingestor` | Google News RSS | every 30 min | 0.8 | keyword-driven RSS feeds |
+| `stocktwits_ingestor` | StockTwits | every 15 min | 0.3 | social sentiment only; excluded from ranking counts |
+| `ranking_engine` | — | every minute | — | Z-score scoring → Redis TTL 90 s |
 
-All workers deduplicate by `Article.url` before inserting.
+All workers deduplicate by `Article.url` (exact) and MinHash/LSH Jaccard similarity ≥ 0.85 before inserting.
 
 ## Ranking Score Formula
 ```
-score = (mentions_1h × 3) + (mentions_24h × 1.5) + (sentiment × 2) + (price_change_pct × 2)
-spike boost: if mentions_1h > (mentions_24h / 24) × 2  →  score × 1.5
+z_score  = (mentions_1h − μ_hourly) / σ_hourly   # 7-day rolling window; 0.0 if σ = 0
+sentiment = weighted_avg(sentiment × source_weight) over last 24 h
+
+score = (z_score × 2) + (mentions_24h × 0.15) + (sentiment × 2) + (price_change_pct × 2)
+spike boost: if z_score ≥ 2.0  →  score × 1.3
 ```
-Redis keys: `trending:global`, `trending:{Sector}` — TTL 90 s
+Stocktwits excluded from all mention counts. Redis keys: `trending:global`, `trending:{Sector}` — TTL 90 s
 
 ## Utilities
-- `utils/ticker_extractor.py` — regex + stopword filter + DB dictionary match
-- `utils/sentiment.py` — TextBlob polarity → `float` in `[-1.0, 1.0]`
-- `utils/query_pipeline.py` — intent detection + sector/ticker entity extraction
+- `utils/ticker_extractor.py` — FinBERT-NER (`dslim/bert-base-NER`) + regex fallback + DB cross-reference; runs in ThreadPoolExecutor
+- `utils/sentiment.py` — FinBERT (`ProsusAI/finbert`) → `float` in `[-1.0, 1.0]`; async wrapper via `asyncio.to_thread`
+- `utils/embeddings.py` — `all-MiniLM-L6-v2` sentence embeddings (384-dim, unit-normalised); async via ThreadPoolExecutor
+- `utils/minhash_dedup.py` — MinHash (128 perms, 3-gram shingles) near-duplicate detection; Jaccard ≥ 0.85 threshold, 24 h window
+- `utils/query_pipeline.py` — intent detection + sector/ticker entity extraction; semantic search uses vector cosine distance
 
 ## Environment Variables
 | Variable | Used by |
@@ -245,7 +257,8 @@ python3 data-pipeline/run_ranking.py
 ## Stage Completion
 - [x] Stage 1 — Scaffold, docker-compose, .env.example, CLAUDE.md
 - [x] Stage 2 — FastAPI backend, DB schema, ingestion workers, sentiment, ticker extraction, cron scheduling
-- [x] Stage 3 — Additional ingestors (Alpha Vantage, Yahoo RSS), deduplication, query pipeline
+- [x] Stage 3 — Additional ingestors (Alpha Vantage, Yahoo RSS), URL deduplication, query pipeline
 - [x] Stage 4 — Search engine + FastAPI endpoints (trending, search, ticker detail)
 - [x] Stage 5 — Frontend (Next.js) UI — dashboard, ticker detail, sentiment chart, news timeline
-- [ ] Stage 6 — Integration, testing, deployment polish
+- [x] Stage 6 (v2) — MinHash/LSH dedup, FinBERT-NER ticker extraction, FinBERT sentiment, Source Authority Matrix, Z-Score anomaly detection, vector embeddings & semantic search, 4 new ingestors (Finnhub, GDELT, Google News, StockTwits)
+- [ ] Stage 7 — Integration, testing, deployment polish

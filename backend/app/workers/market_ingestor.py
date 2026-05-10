@@ -8,6 +8,8 @@ from app.config import settings
 from app.models.article import Article
 from app.models.ticker_mention import TickerMention
 from app.schemas.normalized import NormalizedItem
+from app.utils.embeddings import encode
+from app.utils.minhash_dedup import compute_minhash, is_near_duplicate, load_recent_signatures
 from app.utils.sentiment import analyze_sentiment
 from app.utils.ticker_extractor import extract_tickers_db
 
@@ -37,7 +39,10 @@ async def run(db: AsyncSession) -> list[NormalizedItem]:
     if not settings.polygon_api_key:
         return []
 
+    recent_signatures = await load_recent_signatures(db)
     results: list[NormalizedItem] = []
+    seen_sigs: list[list[int]] = list(recent_signatures)
+
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.get(
             _POLYGON_NEWS_URL,
@@ -53,6 +58,10 @@ async def run(db: AsyncSession) -> list[NormalizedItem]:
 
         for raw in resp.json().get("results", []):
             item = _normalize(raw)
+            sig = compute_minhash(item.content)
+            if is_near_duplicate(sig, seen_sigs):
+                continue
+            seen_sigs.append(sig)
             # Polygon already returns tickers; still verify against DB dictionary
             item.tickers = await extract_tickers_db(
                 f"{item.title or ''} {item.content}", db
@@ -63,6 +72,8 @@ async def run(db: AsyncSession) -> list[NormalizedItem]:
                 content=item.content,
                 url=item.url,
                 timestamp=item.timestamp,
+                minhash_signature=sig,
+                embedding=await encode(f"{item.title or ''} {item.content}"),
             )
             db.add(article)
             await db.flush()
@@ -72,6 +83,7 @@ async def run(db: AsyncSession) -> list[NormalizedItem]:
                         ticker=symbol,
                         article_id=article.id,
                         sentiment=item.sentiment,
+                        source_weight=0.9,
                     )
                 )
             results.append(item)
