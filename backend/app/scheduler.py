@@ -106,15 +106,16 @@ async def _run_cleanup():
 
 def start_scheduler():
     # News: every 30 minutes
-    _scheduler.add_job(_run_news, CronTrigger(minute="*/30"), id="news_ingestor")
+    # PAUSED: LLM ingestion suspended while tuning Docker/Ollama resource limits.
+    # _scheduler.add_job(_run_news, CronTrigger(minute="*/30"), id="news_ingestor")
     # Social: every 15 minutes
     _scheduler.add_job(_run_social, CronTrigger(minute="*/15"), id="social_ingestor")
     # Market news: every hour
     _scheduler.add_job(_run_market, CronTrigger(minute=0), id="market_ingestor")
     # Alpha Vantage: every 6 hours (25 req/day free cap; 6 topics × 4 runs = 24 req/day)
     _scheduler.add_job(_run_alphavantage, CronTrigger(hour="*/6"), id="alphavantage_ingestor")
-    # Yahoo Finance RSS: every hour (no key, no rate limit concern)
-    _scheduler.add_job(_run_yahoo_rss, CronTrigger(minute=30), id="yahoo_rss_ingestor")
+    # Yahoo Finance RSS: PAUSED — calls analyze_article per article (~500/run, saturates Ollama)
+    # _scheduler.add_job(_run_yahoo_rss, CronTrigger(minute=30), id="yahoo_rss_ingestor")
     # GDELT GKG: every 15 minutes (aligns with GDELT's own 15-min snapshot cadence)
     _scheduler.add_job(_run_gdelt, CronTrigger(minute="*/15"), id="gdelt_ingestor")
     # StockTwits retail sentiment: every 20 minutes (sequential per-ticker fetch with 2s sleep)
@@ -123,8 +124,8 @@ def start_scheduler():
     _scheduler.add_job(_run_googlenews, CronTrigger(minute=45), id="googlenews_ingestor")
     # Finnhub general market news: every 30 min (1 call/run, far under 60 req/min free cap)
     _scheduler.add_job(_run_finnhub_general, CronTrigger(minute="*/30"), id="finnhub_general")
-    # Finnhub company news: every 2 hours (≤50 ticker calls/run, token-bucket throttled)
-    _scheduler.add_job(_run_finnhub_company, CronTrigger(hour="*/2", minute=10), id="finnhub_company")
+    # Finnhub company news: PAUSED — calls analyze_article per (ticker, article) pair
+    # _scheduler.add_job(_run_finnhub_company, CronTrigger(hour="*/2", minute=10), id="finnhub_company")
     # Finnhub insider sentiment: every 6 hours (≤50 ticker calls/run, token-bucket throttled)
     _scheduler.add_job(_run_finnhub_insider, CronTrigger(hour="*/6", minute=20), id="finnhub_insider")
     # Ranking engine: every minute

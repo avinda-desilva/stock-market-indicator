@@ -39,8 +39,8 @@ from app.models.article import Article
 from app.models.ticker_mention import TickerMention
 from app.schemas.normalized import NormalizedItem
 from app.utils.embeddings import encode
+from app.utils.llm_analyzer import analyze_article
 from app.utils.minhash_dedup import compute_minhash, is_near_duplicate, load_recent_signatures
-from app.utils.sentiment import analyze_sentiment
 from app.utils.ticker_extractor import extract_tickers_db
 
 logger = logging.getLogger(__name__)
@@ -133,9 +133,6 @@ def _parse_row(cols: list[str]) -> NormalizedItem | None:
     content = " ".join(quote_texts[:3]) if quote_texts else (title or url)
 
     timestamp = _parse_gdelt_datetime(cols[_COL_DATE])
-    text_for_sentiment = f"{title or ''} {content}"
-    sentiment = analyze_sentiment(text_for_sentiment)
-
     url_hash = hashlib.md5(url.encode()).hexdigest()[:12]
 
     return NormalizedItem(
@@ -146,7 +143,7 @@ def _parse_row(cols: list[str]) -> NormalizedItem | None:
         timestamp=timestamp,
         url=url,
         tickers=[],
-        sentiment=sentiment,
+        sentiment=None,  # filled by LLM in run()
     )
 
 
@@ -255,7 +252,18 @@ async def run(db: AsyncSession) -> list[NormalizedItem]:
         seen_sigs.append(sig)
 
         text_for_tickers = f"{item.title or ''} {item.content}"
-        item.tickers = await extract_tickers_db(text_for_tickers, db)
+        candidate_tickers = await extract_tickers_db(text_for_tickers, db)
+        if not candidate_tickers:
+            continue
+
+        llm_tasks = [analyze_article(t, text_for_tickers) for t in candidate_tickers]
+        analyses = await asyncio.gather(*llm_tasks)
+        confirmed = [(a.ticker, a.sentiment, a.summary) for a in analyses if a is not None]
+        if not confirmed:
+            continue
+
+        item.tickers = [sym for sym, _, _ in confirmed]
+        item.sentiment = confirmed[0][1]
 
         article = Article(
             source=item.source,
@@ -264,18 +272,19 @@ async def run(db: AsyncSession) -> list[NormalizedItem]:
             url=item.url,
             timestamp=item.timestamp,
             minhash_signature=sig,
-            embedding=await encode(f"{item.title or ''} {item.content}"),
+            embedding=await encode(text_for_tickers),
         )
         db.add(article)
         await db.flush()
 
-        for symbol in item.tickers:
+        for symbol, sentiment, summary in confirmed:
             db.add(
                 TickerMention(
                     ticker=symbol,
                     article_id=article.id,
-                    sentiment=item.sentiment,
+                    sentiment=sentiment,
                     source_weight=0.75,
+                    llm_summary=summary,
                 )
             )
 

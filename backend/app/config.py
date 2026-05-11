@@ -28,6 +28,12 @@ class Settings(BaseSettings):
     twitter_access_token: str = ""
     twitter_access_token_secret: str = ""
 
+    # Ollama LLM
+    ollama_base_url: str = "http://ollama:11434"
+    ollama_model: str = "llama3.1:8b-instruct-q4_K_M"
+    ollama_max_concurrency: int = 1
+    ollama_timeout: int = 20
+
     @property
     def cors_origins(self) -> list[str]:
         return [o.strip() for o in self.allowed_origins.split(",")]

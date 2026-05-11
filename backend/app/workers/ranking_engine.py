@@ -97,13 +97,13 @@ ticker_stats AS (
     GROUP BY ticker
 ),
 current_hour AS (
-    -- Non-stocktwits mention count for the *current* hour only
+    -- Non-stocktwits mention count for the rolling last 1 hour
     SELECT
         tm.ticker,
         COUNT(tm.id) AS mentions_1h
     FROM ticker_mentions tm
     JOIN articles a ON a.id = tm.article_id
-    WHERE a.timestamp >= date_trunc('hour', NOW() AT TIME ZONE 'UTC')
+    WHERE a.timestamp >= NOW() AT TIME ZONE 'UTC' - INTERVAL '1 hour'
       AND a.source NOT IN ('stocktwits')
     GROUP BY tm.ticker
 ),
@@ -144,7 +144,7 @@ SELECT
     END AS z_score
 FROM tickers t
 LEFT JOIN current_hour  ch  ON ch.ticker  = t.symbol
-LEFT JOIN mentions_24h  m24 ON m24.ticker = t.symbol
+INNER JOIN mentions_24h m24 ON m24.ticker = t.symbol  -- only tickers with ≥1 mention in last 24h
 LEFT JOIN sentiment_24h s   ON s.ticker   = t.symbol
 LEFT JOIN ticker_stats  ts  ON ts.ticker  = t.symbol
 """)
@@ -161,8 +161,8 @@ async def _fetch_zscore_rows(db: AsyncSession) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def _compute_score(z_score: float, mentions_24h: int, sentiment: float, price_change_pct: float) -> float:
-    # Z-score captures relative velocity; 24h volume keeps established tickers visible.
-    return (z_score * 2) + (mentions_24h * 0.15) + (sentiment * 2) + (price_change_pct * 2)
+    # Volume weight 0.3 keeps high-mention tickers visible even during quiet 1h windows.
+    return (z_score * 2) + (mentions_24h * 0.3) + (sentiment * 2) + (price_change_pct * 2)
 
 
 def _apply_spike_boost(score: float, z_score: float) -> float:
