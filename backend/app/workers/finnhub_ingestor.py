@@ -43,8 +43,8 @@ from app.models.ticker import Ticker
 from app.models.ticker_mention import TickerMention
 from app.schemas.normalized import NormalizedItem
 from app.utils.embeddings import encode
+from app.utils.llm_analyzer import analyze_article
 from app.utils.minhash_dedup import compute_minhash, is_near_duplicate, load_recent_signatures
-from app.utils.sentiment import analyze_sentiment
 from app.utils.ticker_extractor import extract_tickers_db
 
 logger = logging.getLogger(__name__)
@@ -143,11 +143,13 @@ async def _persist(
     existing_urls_set: set[str],
     seen_sigs: list[list[int]],
     per_ticker_sentiment: dict[str, float] | None = None,
+    per_ticker_summary: dict[str, str] | None = None,
 ) -> bool:
     """
     Persist one NormalizedItem if its URL hasn't been seen and content is not a near-duplicate.
     Returns True when a new article is written.
     `per_ticker_sentiment` maps symbol → float for fine-grained TickerMention scores.
+    `per_ticker_summary` maps symbol → LLM-generated summary string.
     """
     url = item.url or ""
     if not url or url in seen_urls or url in existing_urls_set:
@@ -184,6 +186,7 @@ async def _persist(
                 article_id=article.id,
                 sentiment=sent,
                 source_weight=0.9,
+                llm_summary=(per_ticker_summary or {}).get(symbol),
             )
         )
     return True
@@ -215,10 +218,7 @@ def _normalize_general(raw: dict, known: set[str]) -> NormalizedItem:
     headline = raw.get("headline") or ""
     summary = raw.get("summary") or headline
     url = raw.get("url") or ""
-    text = f"{headline} {summary}"
-    sentiment = analyze_sentiment(text)
 
-    # Finnhub puts a 'related' field with comma-separated symbols on some items
     related_raw: str = raw.get("related") or ""
     explicit_tickers = [
         s.strip().upper()
@@ -233,8 +233,8 @@ def _normalize_general(raw: dict, known: set[str]) -> NormalizedItem:
         content=summary,
         timestamp=_ts_from_unix(raw.get("datetime")),
         url=url or None,
-        tickers=explicit_tickers,  # NLP enrichment done in run()
-        sentiment=sentiment,
+        tickers=explicit_tickers,
+        sentiment=None,  # filled by LLM in _run_general_news
     )
 
 
@@ -259,13 +259,30 @@ async def _run_general_news(
         if not item.url:
             continue
 
-        # Enrich with DB-backed ticker extraction when no explicit tickers
+        # Candidate extraction: explicit 'related' tickers first, NER fallback
         if not item.tickers:
             item.tickers = await extract_tickers_db(
                 f"{item.title or ''} {item.content}", db
             )
+        if not item.tickers:
+            continue
 
-        if await _persist(db, item, seen, existing, seen_sigs):
+        article_text = f"{item.title or ''}\n\n{item.content}"
+        llm_tasks = [analyze_article(t, article_text) for t in item.tickers]
+        analyses = await asyncio.gather(*llm_tasks)
+
+        confirmed = [(a.ticker, a.sentiment, a.summary) for a in analyses if a is not None]
+        if not confirmed:
+            continue
+
+        item.tickers = [sym for sym, _, _ in confirmed]
+        item.sentiment = confirmed[0][1]
+
+        per_ticker_sent = {sym: sent for sym, sent, _ in confirmed}
+        per_ticker_summ = {sym: summ for sym, _, summ in confirmed}
+        if await _persist(db, item, seen, existing, seen_sigs,
+                          per_ticker_sentiment=per_ticker_sent,
+                          per_ticker_summary=per_ticker_summ):
             results.append(item)
 
     await db.commit()
@@ -311,7 +328,6 @@ def _normalize_company(raw: dict, symbol: str) -> NormalizedItem:
     headline = raw.get("headline") or ""
     summary = raw.get("summary") or headline
     url = raw.get("url") or ""
-    sentiment = analyze_sentiment(f"{headline} {summary}")
 
     return NormalizedItem(
         id=f"finnhub-company-{symbol}-{url}",
@@ -320,8 +336,8 @@ def _normalize_company(raw: dict, symbol: str) -> NormalizedItem:
         content=summary,
         timestamp=_ts_from_unix(raw.get("datetime")),
         url=url or None,
-        tickers=[symbol],  # ticker is explicit — no NLP needed
-        sentiment=sentiment,
+        tickers=[symbol],
+        sentiment=None,  # filled by LLM in _run_company_news
     )
 
 
@@ -357,7 +373,16 @@ async def _run_company_news(
             item = _normalize_company(raw, symbol)
             if not item.url:
                 continue
-            if await _persist(db, item, seen, existing, seen_sigs):
+
+            article_text = f"{item.title or ''}\n\n{item.content}"
+            analysis = await analyze_article(symbol, article_text)
+            if analysis is None:
+                continue
+
+            item.sentiment = analysis.sentiment
+            if await _persist(db, item, seen, existing, seen_sigs,
+                              per_ticker_sentiment={symbol: analysis.sentiment},
+                              per_ticker_summary={symbol: analysis.summary}):
                 results.append(item)
 
         await db.commit()

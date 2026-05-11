@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
@@ -21,7 +21,7 @@ from app.models.article import Article
 from app.models.ticker import Ticker
 from app.models.ticker_mention import TickerMention
 from app.utils.query_pipeline import SECTOR_KEYWORDS
-from app.workers.ranking_engine import _get_redis
+from app.workers.ranking_engine import _get_redis, SPIKE_Z_THRESHOLD, SPIKE_BOOST
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/trending", tags=["trending"])
@@ -48,80 +48,110 @@ async def _live_trending(
     hours: int,
     sector: str | None,
 ) -> list[dict[str, Any]]:
-    """Compute top-N trending tickers directly from Postgres for arbitrary time windows."""
-    now = datetime.now(tz=timezone.utc)
-    cutoff = now - timedelta(hours=hours)
-    cutoff_1h = now - timedelta(hours=1)
+    """Compute top-N trending tickers directly from Postgres using the same
+    z-score formula as the ranking engine, scoped to an arbitrary time window."""
 
-    # Base filter: non-stocktwits mentions within the window
-    base = (
-        select(TickerMention.ticker, func.count(TickerMention.id).label("mentions"))
-        .join(Article, Article.id == TickerMention.article_id)
-        .where(Article.timestamp >= cutoff)
-        .where(Article.source != "stocktwits")
+    sector_filter = "AND t.sector = :sector" if sector else ""
+
+    sql = text(f"""
+    WITH window_mentions AS (
+        SELECT tm.ticker, COUNT(tm.id) AS mentions
+        FROM ticker_mentions tm
+        JOIN articles a ON a.id = tm.article_id
+        JOIN tickers t ON t.symbol = tm.ticker
+        WHERE a.timestamp >= NOW() AT TIME ZONE 'UTC' - INTERVAL '1 hour' * :hours
+          AND a.source NOT IN ('stocktwits')
+          {sector_filter}
+        GROUP BY tm.ticker
+    ),
+    hourly_buckets AS (
+        SELECT tm.ticker,
+               date_trunc('hour', a.timestamp) AS hour_bucket,
+               COUNT(tm.id) AS bucket_mentions
+        FROM ticker_mentions tm
+        JOIN articles a ON a.id = tm.article_id
+        JOIN tickers t ON t.symbol = tm.ticker
+        WHERE a.timestamp >= NOW() AT TIME ZONE 'UTC' - INTERVAL '7 days'
+          AND a.source NOT IN ('stocktwits')
+          {sector_filter}
+        GROUP BY tm.ticker, hour_bucket
+    ),
+    ticker_stats AS (
+        SELECT ticker, AVG(bucket_mentions) AS mu, STDDEV(bucket_mentions) AS sigma
+        FROM hourly_buckets
+        GROUP BY ticker
+    ),
+    recent_1h AS (
+        SELECT tm.ticker, COUNT(tm.id) AS mentions_1h
+        FROM ticker_mentions tm
+        JOIN articles a ON a.id = tm.article_id
+        WHERE a.timestamp >= NOW() AT TIME ZONE 'UTC' - INTERVAL '1 hour'
+          AND a.source NOT IN ('stocktwits')
+          AND tm.ticker IN (SELECT ticker FROM window_mentions)
+        GROUP BY tm.ticker
+    ),
+    sentiment_window AS (
+        SELECT tm.ticker,
+               SUM(tm.sentiment * tm.source_weight) / NULLIF(SUM(tm.source_weight), 0) AS weighted_sentiment
+        FROM ticker_mentions tm
+        JOIN articles a ON a.id = tm.article_id
+        WHERE a.timestamp >= NOW() AT TIME ZONE 'UTC' - INTERVAL '1 hour' * :hours
+          AND tm.sentiment IS NOT NULL
+          AND tm.ticker IN (SELECT ticker FROM window_mentions)
+        GROUP BY tm.ticker
     )
+    SELECT
+        t.symbol,
+        t.sector,
+        t.company_name,
+        wm.mentions                                       AS mentions_window,
+        COALESCE(r1h.mentions_1h, 0)                     AS mentions_1h,
+        COALESCE(sw.weighted_sentiment, 0.0)             AS sentiment,
+        CASE
+            WHEN ts.sigma IS NULL OR ts.sigma = 0 THEN 0.0
+            ELSE (COALESCE(r1h.mentions_1h, 0) - ts.mu) / ts.sigma
+        END AS z_score
+    FROM window_mentions wm
+    JOIN tickers t ON t.symbol = wm.ticker
+    LEFT JOIN recent_1h r1h ON r1h.ticker = wm.ticker
+    LEFT JOIN sentiment_window sw ON sw.ticker = wm.ticker
+    LEFT JOIN ticker_stats ts ON ts.ticker = wm.ticker
+    ORDER BY mentions_window DESC
+    """)
+
+    params: dict[str, Any] = {"hours": hours}
     if sector:
-        base = base.join(Ticker, Ticker.symbol == TickerMention.ticker).where(
-            Ticker.sector == sector
-        )
-    base = base.group_by(TickerMention.ticker)
+        params["sector"] = sector
 
-    mention_rows = await db.execute(base)
-    mention_map: dict[str, int] = {r[0]: r[1] for r in mention_rows}
+    result = await db.execute(sql, params)
+    rows = result.mappings().all()
 
-    if not mention_map:
+    if not rows:
         return []
 
-    # 1-hour mentions (for spike detection)
-    m1h_rows = await db.execute(
-        select(TickerMention.ticker, func.count(TickerMention.id).label("cnt"))
-        .join(Article, Article.id == TickerMention.article_id)
-        .where(Article.timestamp >= cutoff_1h)
-        .where(Article.source != "stocktwits")
-        .where(TickerMention.ticker.in_(list(mention_map.keys())))
-        .group_by(TickerMention.ticker)
-    )
-    m1h_map: dict[str, int] = {r[0]: r[1] for r in m1h_rows}
-
-    # Avg sentiment (all sources — stocktwits has valid sentiment scores)
-    sent_rows = await db.execute(
-        select(TickerMention.ticker, func.avg(TickerMention.sentiment).label("sent"))
-        .join(Article, Article.id == TickerMention.article_id)
-        .where(Article.timestamp >= cutoff)
-        .where(TickerMention.sentiment.is_not(None))
-        .where(TickerMention.ticker.in_(list(mention_map.keys())))
-        .group_by(TickerMention.ticker)
-    )
-    sent_map: dict[str, float] = {r[0]: float(r[1]) for r in sent_rows}
-
-    # Fetch ticker metadata
-    ticker_rows = await db.execute(
-        select(Ticker).where(Ticker.symbol.in_(list(mention_map.keys())))
-    )
-    ticker_meta: dict[str, Ticker] = {t.symbol: t for t in ticker_rows.scalars()}
-
     ranked: list[dict[str, Any]] = []
-    for sym, mentions in mention_map.items():
-        m1h = m1h_map.get(sym, 0)
-        sent = sent_map.get(sym, 0.0)
-        t = ticker_meta.get(sym)
-        # Mirror ranking_engine formula: volume-anchored with mild spike detection
-        score = float(m1h * 3 + mentions * 1.5 + sent * 2)
-        hourly_avg = mentions / hours if mentions else 0
-        spike = hourly_avg > 0 and m1h > (hourly_avg * 2)
-        if spike:
-            score *= 1.3
+    for row in rows:
+        sym = row["symbol"]
+        m_window = int(row["mentions_window"])
+        m1h = int(row["mentions_1h"])
+        sent = float(row["sentiment"])
+        z = float(row["z_score"])
+
+        score = (z * 2) + (m_window * 0.3) + (sent * 2)
+        if z >= SPIKE_Z_THRESHOLD:
+            score *= SPIKE_BOOST
+
         ranked.append({
             "symbol": sym,
-            "sector": (t.sector if t else None) or "Unknown",
-            "company_name": (t.company_name if t else None) or "",
+            "sector": row["sector"] or "Unknown",
+            "company_name": row["company_name"] or "",
             "score": round(score, 4),
             "mentions_1h": m1h,
-            "mentions_24h": mentions,
+            "mentions_24h": m_window,
             "sentiment": round(sent, 4),
             "price_change_pct": 0.0,
-            "spike": spike,
-            "z_score": 0.0,
+            "spike": z >= SPIKE_Z_THRESHOLD,
+            "z_score": round(z, 4),
         })
 
     ranked.sort(key=lambda x: x["score"], reverse=True)

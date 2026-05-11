@@ -6,8 +6,8 @@ Base URL: https://news.google.com/rss/search?q={URL_ENCODED_QUERY}&hl=en-US&gl=U
 
 Strategy: fire all 15 queries concurrently (semaphore-capped), parse the
 Atom-flavored RSS that Google returns, extract title + source + pubDate,
-run TextBlob sentiment and DB-backed ticker extraction, then deduplicate
-against existing Article.url values before persisting.
+run LLM-based ticker extraction + sentiment, then deduplicate against existing
+Article.url values before persisting.
 
 Volume: 15 queries × ~10 items/feed ≈ 150 articles per run, minus duplicates.
 """
@@ -29,8 +29,8 @@ from app.models.article import Article
 from app.models.ticker_mention import TickerMention
 from app.schemas.normalized import NormalizedItem
 from app.utils.embeddings import encode
+from app.utils.llm_analyzer import analyze_article
 from app.utils.minhash_dedup import compute_minhash, is_near_duplicate, load_recent_signatures
-from app.utils.sentiment import analyze_sentiment
 from app.utils.ticker_extractor import extract_tickers_db
 
 logger = logging.getLogger(__name__)
@@ -222,11 +222,9 @@ async def run(db: AsyncSession) -> list[NormalizedItem]:
         title = raw["title"]
         description = raw["description"]
         pub_date = raw["pub_date"]
-        source_name = raw["source_name"] or "googlenews"
 
         timestamp = _parse_rss_date(pub_date) if pub_date else datetime.now(timezone.utc)
         text = f"{title} {description}"
-        sentiment = analyze_sentiment(text)
 
         sig = compute_minhash(_dedup_text(title))
         if is_near_duplicate(sig, seen_sigs):
@@ -234,7 +232,15 @@ async def run(db: AsyncSession) -> list[NormalizedItem]:
         seen_sigs.append(sig)
 
         # DB-backed ticker extraction (symbol + company-name matching)
-        tickers = await extract_tickers_db(text, db)
+        candidate_tickers = await extract_tickers_db(text, db)
+        if not candidate_tickers:
+            continue
+
+        llm_tasks = [analyze_article(t, text) for t in candidate_tickers]
+        analyses = await asyncio.gather(*llm_tasks)
+        confirmed = [(a.ticker, a.sentiment, a.summary) for a in analyses if a is not None]
+        if not confirmed:
+            continue
 
         item = NormalizedItem(
             id=_stable_id(query, url),
@@ -243,8 +249,8 @@ async def run(db: AsyncSession) -> list[NormalizedItem]:
             content=description,
             timestamp=timestamp,
             url=url,
-            tickers=tickers,
-            sentiment=sentiment,
+            tickers=[sym for sym, _, _ in confirmed],
+            sentiment=confirmed[0][1],
         )
 
         article = Article(
@@ -254,18 +260,19 @@ async def run(db: AsyncSession) -> list[NormalizedItem]:
             url=item.url,
             timestamp=item.timestamp,
             minhash_signature=sig,
-            embedding=await encode(f"{item.title or ''} {item.content}"),
+            embedding=await encode(text),
         )
         db.add(article)
         await db.flush()
 
-        for symbol in item.tickers:
+        for symbol, sentiment, summary in confirmed:
             db.add(
                 TickerMention(
                     ticker=symbol,
                     article_id=article.id,
-                    sentiment=item.sentiment,
+                    sentiment=sentiment,
                     source_weight=0.8,
+                    llm_summary=summary,
                 )
             )
 
@@ -318,13 +325,11 @@ if __name__ == "__main__":
 
         for i, item in enumerate(raw_items[:5], 1):
             timestamp = _parse_rss_date(item["pub_date"]) if item["pub_date"] else "N/A"
-            sentiment = analyze_sentiment(f"{item['title']} {item['description']}")
             print(f"[{i}] title      : {item['title']}")
             print(f"     url        : {item['url']}")
             print(f"     source     : {item['source_name']}")
             print(f"     pub_date   : {item['pub_date']}")
             print(f"     timestamp  : {timestamp}")
-            print(f"     sentiment  : {sentiment:.4f}")
             print(f"     description: {item['description'][:120]}...")
             print()
 

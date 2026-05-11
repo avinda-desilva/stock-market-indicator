@@ -10,6 +10,7 @@ API docs: https://www.alphavantage.co/documentation/#news-sentiment
 Endpoint: GET https://www.alphavantage.co/query?function=NEWS_SENTIMENT
 """
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 
@@ -23,9 +24,8 @@ from app.models.ticker import Ticker
 from app.models.ticker_mention import TickerMention
 from app.schemas.normalized import NormalizedItem
 from app.utils.embeddings import encode
+from app.utils.llm_analyzer import analyze_article
 from app.utils.minhash_dedup import compute_minhash, is_near_duplicate, load_recent_signatures
-from app.utils.sentiment import analyze_sentiment
-from app.utils.ticker_extractor import extract_tickers_db
 
 logger = logging.getLogger(__name__)
 
@@ -58,16 +58,14 @@ def _normalize(raw: dict) -> NormalizedItem:
     summary = raw.get("summary") or title
     url = raw.get("url") or ""
 
-    # AV provides its own overall_sentiment_score (float); use it if present,
-    # otherwise fall back to TextBlob on the title+summary.
+    # AV provides its own overall_sentiment_score; use it when present.
     av_score = raw.get("overall_sentiment_score")
+    sentiment: float | None = None
     if av_score is not None:
         try:
             sentiment = float(av_score)
         except (TypeError, ValueError):
-            sentiment = analyze_sentiment(f"{title} {summary}")
-    else:
-        sentiment = analyze_sentiment(f"{title} {summary}")
+            pass
 
     # AV also returns per-ticker sentiment in ticker_sentiment list
     av_tickers = [
@@ -167,15 +165,20 @@ async def run(db: AsyncSession) -> list[NormalizedItem]:
                     continue
                 seen_sigs.append(sig)
 
-                # Merge AV-supplied tickers with DB-verified extraction on title+summary
-                db_tickers = await extract_tickers_db(
-                    f"{item.title or ''} {item.content}", db
-                )
-                # Keep AV tickers that exist in our DB, plus any found by extractor
-                merged = list(
-                    {s for s in item.tickers if s in known} | set(db_tickers)
-                )
-                item.tickers = merged
+                # AV-supplied tickers filtered to known symbols
+                candidate_tickers = [s for s in item.tickers if s in known]
+                if not candidate_tickers:
+                    continue
+
+                article_text = f"{item.title or ''}\n\n{item.content}"
+                llm_tasks = [analyze_article(t, article_text) for t in candidate_tickers]
+                analyses = await asyncio.gather(*llm_tasks)
+                confirmed = [(a.ticker, a.sentiment, a.summary) for a in analyses if a is not None]
+                if not confirmed:
+                    continue
+
+                item.tickers = [sym for sym, _, _ in confirmed]
+                item.sentiment = confirmed[0][1]
 
                 article = Article(
                     source=item.source,
@@ -184,14 +187,14 @@ async def run(db: AsyncSession) -> list[NormalizedItem]:
                     url=item.url,
                     timestamp=item.timestamp,
                     minhash_signature=sig,
-                    embedding=await encode(f"{item.title or ''} {item.content}"),
+                    embedding=await encode(article_text),
                 )
                 db.add(article)
                 await db.flush()
 
-                for symbol in item.tickers:
-                    # Use AV's per-ticker sentiment score when available
-                    ticker_sent = item.sentiment
+                for symbol, sentiment, summary in confirmed:
+                    # Prefer AV's per-ticker score when available; fall back to LLM
+                    ticker_sent = sentiment
                     for ts in raw.get("ticker_sentiment", []):
                         if ts.get("ticker", "").upper() == symbol:
                             try:
@@ -205,6 +208,7 @@ async def run(db: AsyncSession) -> list[NormalizedItem]:
                             article_id=article.id,
                             sentiment=ticker_sent,
                             source_weight=1.0,
+                            llm_summary=summary,
                         )
                     )
 

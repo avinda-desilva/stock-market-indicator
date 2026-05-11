@@ -10,8 +10,9 @@ Strategy:
      already covered in step 1.
   3. Request each symbol sequentially with a 2-second sleep between calls to
      respect StockTwits' undocumented rate limit.
-  4. Map the native StockTwits sentiment tag directly to ±1.0, bypassing
-     TextBlob; fall back to TextBlob only when the tag is absent.
+  4. Map the native StockTwits sentiment tag directly to ±1.0; fall back
+     to 0.0 (neutral) when the tag is absent — short social posts are
+     too noisy for reliable LLM sentiment at this source weight (0.3).
 
 Deduplication: messages are keyed on stocktwits-<message_id> stored as url.
 """
@@ -33,7 +34,6 @@ from app.models.ticker_mention import TickerMention
 from app.schemas.normalized import NormalizedItem
 from app.utils.embeddings import encode
 from app.utils.minhash_dedup import compute_minhash, is_near_duplicate, load_recent_signatures
-from app.utils.sentiment import analyze_sentiment
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +88,7 @@ def _normalize(msg: dict, symbol: str) -> NormalizedItem | None:
         if basic in _SENTIMENT_MAP:
             sentiment_tag = _SENTIMENT_MAP[basic]
 
-    sentiment = sentiment_tag if sentiment_tag is not None else analyze_sentiment(body)
+    sentiment = sentiment_tag if sentiment_tag is not None else 0.0
 
     url = f"https://stocktwits.com/message/{msg_id}"
 

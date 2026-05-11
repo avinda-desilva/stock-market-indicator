@@ -1,4 +1,6 @@
 """Pulls market news from Polygon.io ticker news endpoint and normalizes it."""
+import asyncio
+import logging
 from datetime import datetime, timezone
 
 import httpx
@@ -9,9 +11,11 @@ from app.models.article import Article
 from app.models.ticker_mention import TickerMention
 from app.schemas.normalized import NormalizedItem
 from app.utils.embeddings import encode
+from app.utils.llm_analyzer import analyze_article
 from app.utils.minhash_dedup import compute_minhash, is_near_duplicate, load_recent_signatures
-from app.utils.sentiment import analyze_sentiment
 from app.utils.ticker_extractor import extract_tickers_db
+
+logger = logging.getLogger(__name__)
 
 _POLYGON_NEWS_URL = "https://api.polygon.io/v2/reference/news"
 
@@ -31,7 +35,7 @@ def _normalize(raw: dict) -> NormalizedItem:
         timestamp=published,
         url=raw.get("article_url"),
         tickers=tickers,
-        sentiment=analyze_sentiment(f"{title} {content}"),
+        sentiment=None,  # filled by LLM below
     )
 
 
@@ -62,10 +66,23 @@ async def run(db: AsyncSession) -> list[NormalizedItem]:
             if is_near_duplicate(sig, seen_sigs):
                 continue
             seen_sigs.append(sig)
-            # Polygon already returns tickers; still verify against DB dictionary
-            item.tickers = await extract_tickers_db(
-                f"{item.title or ''} {item.content}", db
-            )
+
+            article_text = f"{item.title or ''}\n\n{item.content}"
+
+            # Polygon provides tickers; verify against DB and run LLM per ticker
+            candidate_tickers = await extract_tickers_db(article_text, db)
+            if not candidate_tickers:
+                continue
+
+            llm_tasks = [analyze_article(t, article_text) for t in candidate_tickers]
+            analyses = await asyncio.gather(*llm_tasks)
+            confirmed = [(a.ticker, a.sentiment, a.summary) for a in analyses if a is not None]
+            if not confirmed:
+                continue
+
+            item.tickers = [sym for sym, _, _ in confirmed]
+            item.sentiment = confirmed[0][1]
+
             article = Article(
                 source=item.source,
                 title=item.title,
@@ -73,17 +90,18 @@ async def run(db: AsyncSession) -> list[NormalizedItem]:
                 url=item.url,
                 timestamp=item.timestamp,
                 minhash_signature=sig,
-                embedding=await encode(f"{item.title or ''} {item.content}"),
+                embedding=await encode(article_text),
             )
             db.add(article)
             await db.flush()
-            for symbol in item.tickers:
+            for symbol, sentiment, summary in confirmed:
                 db.add(
                     TickerMention(
                         ticker=symbol,
                         article_id=article.id,
-                        sentiment=item.sentiment,
+                        sentiment=sentiment,
                         source_weight=0.9,
+                        llm_summary=summary,
                     )
                 )
             results.append(item)

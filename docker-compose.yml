@@ -34,6 +34,29 @@ services:
       timeout: 5s
       retries: 5
 
+  ollama:
+    image: ollama/ollama:latest
+    container_name: smi_ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_models:/root/.ollama
+    deploy:
+      resources:
+        limits:
+          cpus: "3.4"
+          memory: 10G
+        reservations:
+          cpus: "1.5"
+          memory: 4G
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/11434' 2>/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
   backend:
     build:
       context: ./backend
@@ -48,9 +71,19 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      ollama:
+        condition: service_healthy
     volumes:
       - ./backend:/app
       - hf_cache:/root/.cache/huggingface
+    deploy:
+      resources:
+        limits:
+          cpus: "3.0"
+          memory: 3G
+        reservations:
+          cpus: "1.0"
+          memory: 1G
 
   data-pipeline:
     build:
@@ -67,6 +100,11 @@ services:
       - ./data-pipeline:/pipeline
       - ./backend:/app
       - hf_cache:/root/.cache/huggingface
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
 
   frontend:
     build:
@@ -83,8 +121,17 @@ services:
       - "3000:3000"
     depends_on:
       - backend
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1G
+        reservations:
+          cpus: "0.5"
+          memory: 512M
 
 volumes:
   postgres_data:
   redis_data:
   hf_cache:
+  ollama_models:

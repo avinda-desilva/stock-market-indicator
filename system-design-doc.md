@@ -33,7 +33,7 @@ Existing tools either require expensive subscriptions, expose raw data without s
 
 ## 2. Solution Overview
 
-**Stock Market Indicator (SMI)** is a sector-based trending ticker and financial search engine. It continuously ingests articles and social posts from nine distinct data sources, extracts ticker mentions via FinBERT-NER, scores each ticker using a Z-score anomaly detection formula weighted by source authority, and presents a live-updating dashboard with sector filtering, time-window controls, and a semantic vector search engine.
+**Stock Market Indicator (SMI)** is a sector-based trending ticker and financial search engine. It continuously ingests articles and social posts from nine distinct data sources, extracts ticker mentions and sentiment via a local Llama 3.1 8B model (Ollama), scores each ticker using a Z-score anomaly detection formula weighted by source authority, and presents a live-updating dashboard with sector filtering, time-window controls, and a semantic vector search engine.
 
 The application is organized as three cooperating systems:
 
@@ -62,8 +62,8 @@ The application is organized as three cooperating systems:
 │  social_ingestor │ yahoo_rss_ingestor  │ gdelt_ingestor  │ googlenews_ingestor│
 │  stocktwits_ingestor │ ranking_engine                                         │
 │                                                                               │
-│  Normalize → FinBERT Sentiment → FinBERT-NER Ticker Extraction               │
-│  → MinHash Dedup → Embed (MiniLM) → Source Weight → Persist                  │
+│  Normalize → Ollama LLM (ticker confirm + sentiment) → MinHash Dedup         │
+│  → Embed (MiniLM) → Source Weight → Persist                                  │
 └────────────────────────────────┬────────────────────────────────────────────┘
                                 │ SQLAlchemy async writes
                                 ▼
@@ -104,7 +104,7 @@ The data pipeline is the ingestion and scoring layer. It runs entirely within th
 
 ### 4.1 Ingestion Workers
 
-Each worker follows the same contract: accept an `AsyncSession`, fetch data from its source, normalize into a `NormalizedItem`, run FinBERT sentiment and FinBERT-NER ticker extraction, MinHash-deduplicate, generate a sentence embedding, set a source authority weight, persist to PostgreSQL, and commit.
+Each worker follows the same contract: accept an `AsyncSession`, fetch data from its source, normalize into a `NormalizedItem`, run regex+DB ticker candidate extraction, confirm tickers and score sentiment via Ollama (`llm_analyzer.analyze_article`), MinHash-deduplicate, generate a sentence embedding, set a source authority weight, persist to PostgreSQL, and commit. Articles with no LLM-confirmed tickers are discarded.
 
 #### news_ingestor — NewsAPI
 - **Source:** `https://newsapi.org/v2/everything`
@@ -113,7 +113,7 @@ Each worker follows the same contract: accept an `AsyncSession`, fetch data from
 - **Queries:** `["stock market", "NYSE", "NASDAQ", "earnings", "IPO"]`
 - **Key required:** `NEWS_API_KEY`
 - **Source weight:** 0.8
-- **Process:** Fetches article headline + content → FinBERT sentiment → FinBERT-NER ticker extraction → MinHash dedup → embed → upsert
+- **Process:** Fetches article headline + content → regex/DB ticker candidates → Ollama LLM confirms relevance + sentiment per ticker → MinHash dedup → embed → upsert
 
 #### alphavantage_ingestor — Alpha Vantage
 - **Source:** `https://www.alphavantage.co/query?function=NEWS_SENTIMENT`
@@ -122,7 +122,7 @@ Each worker follows the same contract: accept an `AsyncSession`, fetch data from
 - **Topics:** `technology`, `finance`, `energy_transportation`, `manufacturing`, `real_estate`, `retail_wholesale`
 - **Key required:** `ALPHA_VANTAGE_API_KEY`
 - **Source weight:** 1.0 (highest authority — pre-computed financial sentiment)
-- **Special behavior:** AV provides its own `overall_sentiment_score` and per-ticker `ticker_sentiment_score`. These float scores are preferred over FinBERT when available. The worker merges AV-supplied ticker symbols with our DB-verified NER extractor.
+- **Special behavior:** AV-supplied tickers are filtered to known DB symbols then LLM-confirmed. AV's per-ticker `ticker_sentiment_score` is preferred over the LLM score when available.
 
 #### market_ingestor — Polygon.io
 - **Source:** `https://api.polygon.io/v2/reference/news`
@@ -130,7 +130,7 @@ Each worker follows the same contract: accept an `AsyncSession`, fetch data from
 - **Volume:** 50 articles/run
 - **Key required:** `POLYGON_API_KEY`
 - **Source weight:** 0.9
-- **Process:** Polygon returns article-level ticker arrays; these are cross-validated against the DB ticker dictionary before being saved as `TickerMention` rows.
+- **Process:** Polygon returns article-level ticker arrays; these are cross-validated against the DB ticker dictionary then LLM-confirmed (relevance + sentiment) before being saved as `TickerMention` rows.
 
 #### social_ingestor — Twitter/X & Reddit
 - **Source:**
@@ -148,54 +148,60 @@ Each worker follows the same contract: accept an `AsyncSession`, fetch data from
 - **Volume:** ~50 tickers × 15 items/feed = ~750 article candidates/run, minus duplicates
 - **Key required:** None (public RSS feed)
 - **Source weight:** 0.85
-- **Process:** Fetches all tracked ticker symbols concurrently (capped at 5 simultaneous requests via asyncio Semaphore). Parses XML with stdlib `xml.etree`. Each feed item is inherently tied to a known ticker, so no NER extraction is needed for ticker association.
+- **Process:** Fetches all tracked ticker symbols concurrently (capped at 5 simultaneous requests via asyncio Semaphore). Parses XML with stdlib `xml.etree`. Each feed item is tied to a known ticker; Ollama confirms relevance and scores sentiment per (ticker, article) pair.
 
 #### finnhub_ingestor — Finnhub
 - **Source:** `https://finnhub.io/api/v1/news`
 - **Schedule:** Every 30 minutes
 - **Key required:** `FINNHUB_API_KEY`
 - **Source weight:** 0.9
-- **Process:** Fetches general financial news; FinBERT-NER extracts tickers from article text. High-quality curated source, weight near Polygon.
+- **Process:** Fetches general financial news; regex/DB ticker candidates are LLM-confirmed (relevance + sentiment). High-quality curated source, weight near Polygon.
 
 #### gdelt_ingestor — GDELT
 - **Source:** GDELT GKG / Event API
 - **Schedule:** Hourly
 - **Key required:** None (public)
 - **Source weight:** 0.75
-- **Process:** Ingests broadcast/print media events with financial relevance signals. Lower authority weight due to broad source coverage including unvetted outlets.
+- **Process:** Ingests broadcast/print media events with financial relevance signals; regex/DB ticker candidates LLM-confirmed. Lower authority weight due to broad source coverage including unvetted outlets.
 
 #### googlenews_ingestor — Google News RSS
 - **Source:** `https://news.google.com/rss/search?q={query}`
 - **Schedule:** Every 30 minutes
 - **Key required:** None (public RSS)
 - **Source weight:** 0.8
-- **Process:** Finance-keyword-driven RSS feeds; FinBERT-NER ticker extraction. Comparable authority to NewsAPI.
+- **Process:** Finance-keyword-driven RSS feeds; regex/DB ticker candidates LLM-confirmed. Comparable authority to NewsAPI.
 
 #### stocktwits_ingestor — StockTwits
 - **Source:** StockTwits stream API
 - **Schedule:** Every 15 minutes
 - **Key required:** None (public)
 - **Source weight:** 0.3
-- **Process:** Social sentiment only; FinBERT scores posts. StockTwits mentions are **excluded from all ranking mention counts** — they inflate volume without contributing to the news timeline. Used only for supplemental sentiment signal.
+- **Process:** Social sentiment only. Native StockTwits Bullish/Bearish tags map directly to ±1.0; untagged posts default to 0.0 (neutral). StockTwits mentions are **excluded from all ranking mention counts** — used only for supplemental weighted sentiment signal.
 
-### 4.2 Ticker Extraction (`utils/ticker_extractor.py`)
+### 4.2 Ticker Candidate Extraction (`utils/ticker_extractor.py`)
 
-Uses a **FinBERT-NER pipeline** (`dslim/bert-base-NER`) loaded once at startup as a module-level singleton. NER inference runs in a shared `ThreadPoolExecutor` so async callers are never blocked.
+Used as the first pass to produce candidate symbols before LLM confirmation. No NER model is loaded at runtime.
 
 **Pipeline:**
-1. Text is truncated to 1,500 chars (~512 tokens) before passing to the NER model
-2. `dslim/bert-base-NER` tags named entities; `ORG` entities are extracted as candidate ticker names
-3. Candidates are uppercased and cross-referenced against the `tickers` table in PostgreSQL — only DB-confirmed symbols are kept
-4. **Fallback:** If the NER model is unavailable (import error or OOM), the extractor falls back to regex `\$?([A-Z]{2,5})\b` + an expanded stopword filter
+1. Regex `\$?([A-Z]{2,5})\b` extracts uppercase token candidates; a stopword filter removes common English words
+2. Candidates are cross-referenced against the `tickers` table in PostgreSQL — only DB-confirmed symbols pass through
+3. Company-name keyword matching provides a second resolution pass for multi-word ORG mentions (e.g. "Apple Inc" → AAPL)
 
-### 4.3 Sentiment Analysis (`utils/sentiment.py`)
+Output is a list of candidate symbols that is then passed to `llm_analyzer.analyze_article` for relevance confirmation and sentiment scoring.
 
-All text-level sentiment uses **FinBERT** (`ProsusAI/finbert`):
-- Domain-specific financial language model; outperforms TextBlob on earnings/analyst/market text
-- Returns a `float` in `[-1.0, 1.0]`: positive confidence → positive score, negative confidence → negative score, neutral → 0.0
-- Text is pre-trimmed to 2,000 chars to bound tokenizer input
-- Exposed as both a sync (`analyze_sentiment`) and async (`analyze_sentiment_async`) interface via `asyncio.to_thread`
-- Alpha Vantage articles may still override with their own pre-computed float score
+### 4.3 LLM Analysis (`utils/llm_analyzer.py`)
+
+All ticker confirmation and sentiment scoring uses a **local Llama 3.1 8B model** served by Ollama (`smi_ollama` container, port 11434).
+
+**Per-(article, ticker) call:**
+1. Article text is truncated to 3,000 chars to keep CPU inference under the timeout
+2. A structured JSON prompt asks the model to: (a) confirm whether the ticker is a *primary* focus, (b) score financial sentiment as a float in `[-1.0, 1.0]`, (c) write a 2-sentence impact summary
+3. Response is parsed and validated via Pydantic (`LLMAnalysis`); JSON extraction handles fenced code blocks and noisy output
+4. Articles where `is_relevant=false` are dropped (no `TickerMention` row written)
+5. A module-level `asyncio.Semaphore` (controlled by `OLLAMA_MAX_CONCURRENCY`, default 1) caps concurrent in-flight requests to prevent OOM on the Ollama container
+6. Up to `_MAX_RETRIES=2` attempts on timeout; non-transient HTTP errors abort immediately
+
+`llm_summary` (the 2-sentence impact string) is stored in `ticker_mentions.llm_summary` for display in the news timeline.
 
 ### 4.4 Deduplication
 
@@ -420,7 +426,6 @@ Typed fetch functions:
 | Pydantic | 2.11.4 | Data validation + settings |
 | pydantic-settings | 2.9.1 | `.env` config management |
 | httpx | 0.28.1 | Async HTTP client for external APIs |
-| transformers | 4.x | FinBERT sentiment (`ProsusAI/finbert`) + FinBERT-NER (`dslim/bert-base-NER`) |
 | sentence-transformers | 3.x | `all-MiniLM-L6-v2` 384-dim embeddings |
 | datasketch | 1.6.x | MinHash / LSH near-duplicate detection |
 | APScheduler | 3.11.0 | In-process async cron scheduler |
@@ -447,6 +452,7 @@ Typed fetch functions:
 |-----------|-----------|---------|
 | Database | PostgreSQL + pgvector | 15-alpine |
 | Cache | Redis | 7-alpine |
+| LLM inference | Ollama (Llama 3.1 8B, 4-bit) | latest |
 | Containerization | Docker + Docker Compose | v3.9 |
 | Container orchestration | Docker Compose | — |
 
@@ -458,14 +464,14 @@ Typed fetch functions:
 - **Variable:** `NEWS_API_KEY`
 - **Endpoint:** `https://newsapi.org/v2/everything`
 - **What it provides:** English-language financial news articles (headline, description, full content, publication timestamp, source URL)
-- **How it's used:** Queried with 5 finance-focused keyword queries. Articles are normalized, sentiment-scored, and ticker-extracted before being stored.
+- **How it's used:** Queried with 5 finance-focused keyword queries. Articles are normalized; regex/DB ticker candidates are LLM-confirmed for relevance and sentiment before being stored.
 - **Rate limit:** Free tier: 100 requests/day, 1,000 articles/day
 
 ### Alpha Vantage
 - **Variable:** `ALPHA_VANTAGE_API_KEY`
 - **Endpoint:** `https://www.alphavantage.co/query?function=NEWS_SENTIMENT`
 - **What it provides:** Financial news feed with pre-computed overall sentiment scores and per-ticker sentiment scores
-- **How it's used:** Queried across 6 sector topic slugs every 6 hours. AV's own sentiment scores are used directly when available (bypassing TextBlob). AV also returns `ticker_sentiment[]` arrays, which are merged with our DB-verified ticker extraction.
+- **How it's used:** Queried across 6 sector topic slugs every 6 hours. AV-supplied tickers are filtered to known DB symbols then LLM-confirmed. AV's per-ticker `ticker_sentiment_score` is preferred over the LLM sentiment when available.
 - **Rate limit:** Free tier: 25 requests/day. The 6-topic schedule uses 24 requests/day (6 topics × 4 runs).
 
 ### Polygon.io
@@ -479,7 +485,7 @@ Typed fetch functions:
 - **Variable:** `TWITTER_BEARER_TOKEN`
 - **Endpoint:** `https://api.twitter.com/2/tweets/search/recent`
 - **What it provides:** Recent English-language tweets matching financial search queries
-- **How it's used:** 3 query templates (stock market, exchange names, earnings) fetch up to 20 tweets each. Tweet text is run through TextBlob sentiment and DB ticker extraction.
+- **How it's used:** 3 query templates (stock market, exchange names, earnings) fetch up to 20 tweets each. Regex/DB ticker candidates are LLM-confirmed for relevance and sentiment.
 - **Rate limit:** Requires paid API access (Basic tier or higher)
 - **Behavior:** Gracefully skips if token is not set
 
@@ -487,38 +493,38 @@ Typed fetch functions:
 - **Variables:** `REDDIT_CLIENT_ID`, `REDDIT_CLIENT_SECRET`, `REDDIT_USER_AGENT`
 - **Library:** PRAW (Python Reddit API Wrapper)
 - **What it provides:** Top posts from financial subreddits (r/stocks, r/wallstreetbets, r/investing, r/StockMarket)
-- **How it's used:** Fetches 25 hot posts per subreddit. Post title + body is run through TextBlob sentiment and DB ticker extraction.
+- **How it's used:** Fetches 25 hot posts per subreddit. Regex/DB ticker candidates are LLM-confirmed for relevance and sentiment.
 - **Behavior:** Gracefully skips if credentials are not set
 
 ### Yahoo Finance RSS
 - **No API key required**
 - **Endpoint:** `https://feeds.finance.yahoo.com/rss/2.0/headline?s={SYMBOL}`
 - **What it provides:** Public per-ticker RSS news feeds (headline, link, description, publication date)
-- **How it's used:** All ticker symbols in the DB are iterated. Feeds are fetched concurrently (max 5 simultaneous). Since the feed is per-ticker, no NER extraction is needed — the ticker is known from the feed URL. Each item's headline + description is FinBERT-scored.
+- **How it's used:** All ticker symbols in the DB are iterated. Feeds are fetched concurrently (max 5 simultaneous). The ticker is known from the feed URL; Ollama confirms relevance and scores sentiment per (ticker, article) pair.
 - **Volume:** ~50 tickers × 15 items = ~750 candidates/run (after deduplication, much less)
 
 ### Finnhub
 - **Variable:** `FINNHUB_API_KEY`
 - **Endpoint:** `https://finnhub.io/api/v1/news`
 - **What it provides:** Curated financial news with company coverage
-- **How it's used:** Fetched every 30 minutes; FinBERT-NER extracts ticker mentions from article text. High source weight (0.9) due to curated feed quality.
+- **How it's used:** Fetched every 30 minutes; regex/DB ticker candidates are LLM-confirmed. High source weight (0.9) due to curated feed quality.
 - **Rate limit:** Free tier: 60 API calls/minute
 
 ### GDELT
 - **No API key required**
 - **What it provides:** Global news event database including broadcast, print, and web media with financial relevance signals
-- **How it's used:** Fetched hourly; lower source weight (0.75) due to broad, unvetted source coverage. FinBERT-NER extracts tickers.
+- **How it's used:** Fetched hourly; lower source weight (0.75) due to broad, unvetted source coverage. Regex/DB ticker candidates are LLM-confirmed.
 
 ### Google News RSS
 - **No API key required**
 - **Endpoint:** `https://news.google.com/rss/search?q={query}`
 - **What it provides:** Aggregated financial news from diverse outlets
-- **How it's used:** Finance-keyword-driven RSS queries every 30 minutes; FinBERT-NER ticker extraction.
+- **How it's used:** Finance-keyword-driven RSS queries every 30 minutes; regex/DB ticker candidates are LLM-confirmed.
 
 ### StockTwits
 - **No API key required (public stream)**
 - **What it provides:** Real-time social sentiment from retail investors; posts are typically short, ticker-tagged messages
-- **How it's used:** Fetched every 15 minutes. FinBERT scores posts. **Excluded from all ranking mention counts** to prevent social volume inflation; used only for supplemental weighted sentiment signal. Source weight: 0.3.
+- **How it's used:** Fetched every 15 minutes. Native Bullish/Bearish tags map to ±1.0; untagged posts default to 0.0. **Excluded from all ranking mention counts**; used only for supplemental weighted sentiment signal. Source weight: 0.3.
 
 ---
 
@@ -543,19 +549,16 @@ This section traces the full lifecycle of a single article from external API to 
      sentiment: 0.0  ← placeholder
    }
 
-3. SENTIMENT
-   analyze_sentiment_async("{title} {content}")
-   → FinBERT("ProsusAI/finbert") → label="positive", confidence=0.91
-   → polarity = +0.91  ← stored in NormalizedItem.sentiment
-
-4. TICKER EXTRACTION
+3. TICKER CANDIDATES
    extract_tickers_db("Apple beats Q3 earnings expectations Apple Inc. reported...", db)
-   → dslim/bert-base-NER tags: [("Apple", ORG), ("Apple Inc.", ORG)]
-   → candidates uppercased: ["APPLE"]
-   → DB lookup: SELECT symbol FROM tickers WHERE symbol IN ('APPLE')
-   → cross-reference returns []  (no match for "APPLE")
-   → separately NER / regex finds "AAPL" if present in text
-   → returns ["AAPL"]
+   → regex + company-name keyword match → candidates: ["AAPL"]
+   → DB cross-reference confirms symbol exists → returns ["AAPL"]
+
+4. LLM CONFIRMATION + SENTIMENT
+   analyze_article("AAPL", "{title}\n\n{content}")
+   → Ollama POST /api/chat (Llama 3.1 8B, temperature=0)
+   → response JSON: { "ticker": "AAPL", "is_relevant": true, "sentiment": 0.91, "summary": "..." }
+   → polarity = +0.91, summary stored in ticker_mention.llm_summary
 
 5. DEDUPLICATE — Layer 1 (exact URL)
    SELECT url FROM articles WHERE url = 'https://...'
@@ -575,8 +578,8 @@ This section traces the full lifecycle of a single article from external API to 
    VALUES (..., [sig_ints], [vec_floats])
    → article.id = 9821
 
-   INSERT INTO ticker_mentions (ticker, article_id, sentiment, source_weight)
-   VALUES ('AAPL', 9821, 0.91, 0.8)  ← source_weight=0.8 for newsapi
+   INSERT INTO ticker_mentions (ticker, article_id, sentiment, source_weight, llm_summary)
+   VALUES ('AAPL', 9821, 0.91, 0.8, 'Apple beat Q3 estimates...')  ← source_weight=0.8 for newsapi
 
 8. COMMIT
    db.commit()
@@ -643,8 +646,9 @@ This section traces the full lifecycle of a single article from external API to 
 | `id` | INTEGER (PK, auto) | |
 | `ticker` | VARCHAR (FK → tickers.symbol) | |
 | `article_id` | INTEGER (FK → articles.id, CASCADE DELETE) | |
-| `sentiment` | FLOAT | FinBERT polarity score in `[-1.0, 1.0]` |
+| `sentiment` | FLOAT | LLM polarity score in `[-1.0, 1.0]` |
 | `source_weight` | FLOAT | Authority weight set by ingestor (0.0–1.0); default 1.0 |
+| `llm_summary` | TEXT | Nullable 2-sentence impact summary from Ollama |
 | `created_at` | TIMESTAMPTZ | Ingestion time |
 
 > **Design note:** `Article.timestamp` is the article's publication time. `TickerMention.created_at` (ingestion time) is intentionally excluded from all window-filter queries. This means the `24h` window shows articles *published* in the last 24 hours, not articles *ingested* in that period.
@@ -778,6 +782,7 @@ The 90-second TTL ensures that even if the ranking engine misses a run or Redis 
 |-----------|-------|------|------|
 | `smi_postgres` | `postgres:15-alpine` | 5432 | Persistent relational store |
 | `smi_redis` | `redis:7-alpine` | 6379 | Trending score cache |
+| `smi_ollama` | `ollama/ollama` | 11434 | Local LLM inference (Llama 3.1 8B) |
 | `smi_backend` | Custom (FastAPI) | 8000 | API + scheduler + workers |
 | `smi_pipeline` | Same as backend | — | One-shot seed on startup, exits |
 | `smi_frontend` | Custom (Next.js) | 3000 | UI server |
@@ -813,6 +818,10 @@ pipeline  (waits: postgres healthy)
 | `REDDIT_CLIENT_ID` | social_ingestor | Reddit OAuth client ID |
 | `REDDIT_CLIENT_SECRET` | social_ingestor | Reddit OAuth client secret |
 | `REDDIT_USER_AGENT` | social_ingestor | Reddit API user agent string |
+| `OLLAMA_BASE_URL` | llm_analyzer | Ollama server URL (default: `http://ollama:11434`) |
+| `OLLAMA_MODEL` | llm_analyzer | Model tag (default: `llama3.1:8b`) |
+| `OLLAMA_MAX_CONCURRENCY` | llm_analyzer | Max simultaneous Ollama requests (default: 1) |
+| `OLLAMA_TIMEOUT` | llm_analyzer | Per-request timeout in seconds (default: 120) |
 
 ### Backup & Recovery
 
@@ -826,4 +835,4 @@ gunzip -c backups/smi_<timestamp>.sql.gz | \
 
 ---
 
-*Document updated: 2026-05-10 | Version: 0.3.0 | Stage: 6 (v2 features) complete*
+*Document updated: 2026-05-10 | Version: 0.4.0 | Stage: 7 (Ollama LLM migration) in progress*

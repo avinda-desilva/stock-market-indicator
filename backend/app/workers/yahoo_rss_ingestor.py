@@ -6,10 +6,12 @@ Yahoo publishes a public RSS feed per ticker:
 
 Strategy: iterate over all tickers in the DB, fetch each feed, parse with
 stdlib xml.etree (no extra dependency). To avoid hammering Yahoo we cap
-concurrent requests at 5 and skip symbols whose feed was recently fetched
-(tracked in-memory per process lifetime).
+concurrent HTTP requests at 5.
 
 Volume: 50 tickers × ~10 items/feed = ~500 articles per run, minus duplicates.
+LLM analysis is throttled by the shared Ollama semaphore in llm_analyzer — with
+OLLAMA_MAX_CONCURRENCY=1 the calls drain sequentially, preventing OOM on the
+Ollama container regardless of batch size.
 """
 
 import asyncio
@@ -27,19 +29,18 @@ from app.models.ticker import Ticker
 from app.models.ticker_mention import TickerMention
 from app.schemas.normalized import NormalizedItem
 from app.utils.embeddings import encode
+from app.utils.llm_analyzer import analyze_article
 from app.utils.minhash_dedup import compute_minhash, is_near_duplicate, load_recent_signatures
-from app.utils.sentiment import analyze_sentiment
 
 logger = logging.getLogger(__name__)
 
 _RSS_URL = "https://feeds.finance.yahoo.com/rss/2.0/headline"
-_CONCURRENCY = 5          # max simultaneous HTTP requests
-_TIMEOUT = 10             # seconds per request
+_HTTP_CONCURRENCY = 5     # max simultaneous HTTP fetches (unrelated to Ollama)
+_TIMEOUT = 10             # seconds per HTTP request
 _MAX_ITEMS_PER_FEED = 15  # cap per ticker to keep DB growth reasonable
 
 
 def _parse_rss_date(date_str: str) -> datetime:
-    """Parse RFC-2822 date from RSS <pubDate> tag."""
     try:
         return parsedate_to_datetime(date_str).astimezone(timezone.utc).replace(tzinfo=timezone.utc)
     except Exception:
@@ -47,7 +48,6 @@ def _parse_rss_date(date_str: str) -> datetime:
 
 
 def _parse_feed(xml_bytes: bytes, symbol: str) -> list[NormalizedItem]:
-    """Extract items from a Yahoo Finance RSS feed for *symbol*."""
     try:
         root = ET.fromstring(xml_bytes)
     except ET.ParseError as exc:
@@ -72,8 +72,6 @@ def _parse_feed(xml_bytes: bytes, symbol: str) -> list[NormalizedItem]:
             continue
 
         timestamp = _parse_rss_date(pub_date) if pub_date else datetime.now(timezone.utc)
-        text = f"{title} {description}"
-        sentiment = analyze_sentiment(text)
 
         items.append(
             NormalizedItem(
@@ -83,8 +81,8 @@ def _parse_feed(xml_bytes: bytes, symbol: str) -> list[NormalizedItem]:
                 content=description,
                 timestamp=timestamp,
                 url=url,
-                tickers=[symbol],  # we know the ticker — it's the feed we fetched
-                sentiment=sentiment,
+                tickers=[symbol],
+                sentiment=None,  # filled by LLM below
             )
         )
 
@@ -92,7 +90,6 @@ def _parse_feed(xml_bytes: bytes, symbol: str) -> list[NormalizedItem]:
 
 
 async def _fetch_feed(client: httpx.AsyncClient, symbol: str) -> tuple[str, bytes | None]:
-    """Fetch RSS XML for *symbol*. Returns (symbol, bytes) or (symbol, None) on error."""
     try:
         resp = await client.get(
             _RSS_URL,
@@ -109,25 +106,25 @@ async def _fetch_feed(client: httpx.AsyncClient, symbol: str) -> tuple[str, byte
 
 
 async def run(db: AsyncSession) -> list[NormalizedItem]:
-    # Load all ticker symbols from DB
     rows = await db.execute(select(Ticker.symbol))
     symbols = [r[0] for r in rows]
     if not symbols:
         logger.info("yahoo_rss_ingestor: no tickers in DB — skipping")
         return []
 
-    # Fetch all feeds concurrently, capped at _CONCURRENCY simultaneous requests
-    semaphore = asyncio.Semaphore(_CONCURRENCY)
+    # Fetch all RSS feeds concurrently, capped at _HTTP_CONCURRENCY.
+    # This semaphore controls network I/O only — the Ollama semaphore in
+    # llm_analyzer handles LLM concurrency separately.
+    http_sem = asyncio.Semaphore(_HTTP_CONCURRENCY)
 
     async def _guarded_fetch(client: httpx.AsyncClient, sym: str):
-        async with semaphore:
+        async with http_sem:
             return await _fetch_feed(client, sym)
 
     async with httpx.AsyncClient(headers={"User-Agent": "stock-market-indicator/1.0"}) as client:
         tasks = [_guarded_fetch(client, sym) for sym in symbols]
         feed_results: list[tuple[str, bytes | None]] = await asyncio.gather(*tasks)
 
-    # Parse all feeds and collect candidate items
     candidates: list[NormalizedItem] = []
     for symbol, xml_bytes in feed_results:
         if xml_bytes:
@@ -137,7 +134,7 @@ async def run(db: AsyncSession) -> list[NormalizedItem]:
         logger.info("yahoo_rss_ingestor: no items parsed from any feed")
         return []
 
-    # Deduplicate by URL against the DB in one batch query
+    # Bulk URL dedup against DB
     candidate_urls = list({c.url for c in candidates if c.url})
     existing_rows = await db.execute(
         select(Article.url).where(Article.url.in_(candidate_urls))
@@ -160,6 +157,19 @@ async def run(db: AsyncSession) -> list[NormalizedItem]:
             continue
         seen_sigs.append(sig)
 
+        # item.tickers[0] is always set by _parse_feed (the feed's own symbol)
+        ticker = item.tickers[0]
+        article_text = f"{item.title or ''}\n\n{item.content}"
+
+        # LLM: confirm relevance + get per-ticker sentiment.
+        # Semaphore inside analyze_article caps Ollama concurrency globally.
+        analysis = await analyze_article(ticker, article_text)
+        if analysis is None:
+            # LLM judged the article irrelevant to this ticker — skip.
+            continue
+
+        item.sentiment = analysis.sentiment
+
         article = Article(
             source=item.source,
             title=item.title,
@@ -167,23 +177,25 @@ async def run(db: AsyncSession) -> list[NormalizedItem]:
             url=item.url,
             timestamp=item.timestamp,
             minhash_signature=sig,
-            embedding=await encode(f"{item.title or ''} {item.content}"),
+            embedding=await encode(article_text),
         )
         db.add(article)
         await db.flush()
 
-        for symbol in item.tickers:
-            db.add(
-                TickerMention(
-                    ticker=symbol,
-                    article_id=article.id,
-                    sentiment=item.sentiment,
-                    source_weight=0.85,
-                )
+        db.add(
+            TickerMention(
+                ticker=ticker,
+                article_id=article.id,
+                sentiment=analysis.sentiment,
+                source_weight=0.85,
+                llm_summary=analysis.summary,
             )
-
+        )
         results.append(item)
 
     await db.commit()
-    logger.info("yahoo_rss_ingestor: persisted %d new articles across %d tickers", len(results), len(symbols))
+    logger.info(
+        "yahoo_rss_ingestor: persisted %d new articles across %d tickers",
+        len(results), len(symbols),
+    )
     return results

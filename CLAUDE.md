@@ -27,13 +27,13 @@ Sector-Based Trending Ticker & Financial Search Engine. Monorepo with a Next.js 
 │   │   ├── config.py
 │   │   ├── database.py
 │   │   ├── scheduler.py
-│   │   ├── models/            # Article (+ minhash_signature, embedding), Ticker, TickerMention (+ source_weight)
+│   │   ├── models/            # Article (+ minhash_signature, embedding), Ticker, TickerMention (+ source_weight, llm_summary)
 │   │   ├── schemas/           # normalized.py, ticker.py, article.py, search.py
 │   │   ├── routers/           # ingestors.py, tickers.py, trending.py, search.py, ticker_detail.py
 │   │   ├── workers/           # news_ingestor, social_ingestor, market_ingestor,
 │   │   │                      # alphavantage_ingestor, yahoo_rss_ingestor, ranking_engine,
 │   │   │                      # finnhub_ingestor, gdelt_ingestor, googlenews_ingestor, stocktwits_ingestor
-│   │   ├── utils/             # ticker_extractor.py (FinBERT-NER), sentiment.py (FinBERT),
+│   │   ├── utils/             # ticker_extractor.py (regex+DB), llm_analyzer.py (Ollama),
 │   │   │                      # embeddings.py (MiniLM), minhash_dedup.py, query_pipeline.py
 │   │   └── migrations/        # Alembic env + versions/0001–0004
 │   ├── requirements.txt
@@ -58,6 +58,7 @@ Sector-Based Trending Ticker & Financial Search Engine. Monorepo with a Next.js 
 | Backend    | 8000 |
 | PostgreSQL | 5432 |
 | Redis      | 6379 |
+| Ollama     | 11434 |
 
 ## Docker Containers
 | Container      | Role |
@@ -65,6 +66,7 @@ Sector-Based Trending Ticker & Financial Search Engine. Monorepo with a Next.js 
 | `smi_backend`  | FastAPI + APScheduler (all cron jobs live here) |
 | `smi_postgres` | PostgreSQL data store |
 | `smi_redis`    | Redis cache (trending scores) |
+| `smi_ollama`   | Local LLM inference — Llama 3.1 8B (ticker confirm + sentiment) |
 | `smi_pipeline` | One-shot bulk seed on startup, then exits |
 | `smi_frontend` | Next.js UI |
 
@@ -101,7 +103,7 @@ docker compose down && docker compose up -d --build
 |---|---|
 | `tickers` | `symbol` (PK), `sector`, `company_name` |
 | `articles` | `id`, `source`, `title`, `content`, `url`, `timestamp`, `minhash_signature` (JSONB), `embedding` (vector 384) |
-| `ticker_mentions` | `id`, `ticker` (FK→tickers), `article_id` (FK→articles), `sentiment`, `source_weight` |
+| `ticker_mentions` | `id`, `ticker` (FK→tickers), `article_id` (FK→articles), `sentiment`, `source_weight`, `llm_summary` |
 
 > Time-window queries must filter on `Article.timestamp` (publication time), not `TickerMention.created_at` (ingestion time).
 
@@ -166,13 +168,13 @@ Returns `SearchResponse`: `{ query, intent, tickers[{symbol, score, mentions_24h
 | `market_ingestor` | Polygon.io | hourly :00 | 0.9 | 50 articles/run |
 | `alphavantage_ingestor` | Alpha Vantage | every 6 h | 1.0 | 6 topics × 50; 24 req/day (free cap = 25) |
 | `yahoo_rss_ingestor` | Yahoo Finance RSS | hourly :30 | 0.85 | per-ticker RSS, no key, ~500 articles/run |
-| `finnhub_ingestor` | Finnhub | every 30 min | 0.9 | financial news + company NER |
+| `finnhub_ingestor` | Finnhub | every 30 min | 0.9 | financial news; LLM ticker confirm + sentiment |
 | `gdelt_ingestor` | GDELT | hourly | 0.75 | broadcast/print media events |
 | `googlenews_ingestor` | Google News RSS | every 30 min | 0.8 | keyword-driven RSS feeds |
 | `stocktwits_ingestor` | StockTwits | every 15 min | 0.3 | social sentiment only; excluded from ranking counts |
 | `ranking_engine` | — | every minute | — | Z-score scoring → Redis TTL 90 s |
 
-All workers deduplicate by `Article.url` (exact) and MinHash/LSH Jaccard similarity ≥ 0.85 before inserting.
+All workers deduplicate by `Article.url` (exact) and MinHash/LSH Jaccard similarity ≥ 0.85 before inserting. All workers (except `stocktwits_ingestor`) use Ollama (`llm_analyzer.analyze_article`) to confirm ticker relevance and score sentiment; articles with no confirmed tickers are discarded.
 
 ## Ranking Score Formula
 ```
@@ -185,8 +187,8 @@ spike boost: if z_score ≥ 2.0  →  score × 1.3
 Stocktwits excluded from all mention counts. Redis keys: `trending:global`, `trending:{Sector}` — TTL 90 s
 
 ## Utilities
-- `utils/ticker_extractor.py` — FinBERT-NER (`dslim/bert-base-NER`) + regex fallback + DB cross-reference; runs in ThreadPoolExecutor
-- `utils/sentiment.py` — FinBERT (`ProsusAI/finbert`) → `float` in `[-1.0, 1.0]`; async wrapper via `asyncio.to_thread`
+- `utils/ticker_extractor.py` — regex `\$?([A-Z]{2,5})` + stopword filter + DB cross-reference; produces candidate symbols for LLM confirmation
+- `utils/llm_analyzer.py` — Ollama HTTP client (Llama 3.1 8B); confirms ticker relevance, scores sentiment `[-1.0, 1.0]`, returns 2-sentence `llm_summary`; semaphore-throttled to `OLLAMA_MAX_CONCURRENCY` (default 1)
 - `utils/embeddings.py` — `all-MiniLM-L6-v2` sentence embeddings (384-dim, unit-normalised); async via ThreadPoolExecutor
 - `utils/minhash_dedup.py` — MinHash (128 perms, 3-gram shingles) near-duplicate detection; Jaccard ≥ 0.85 threshold, 24 h window
 - `utils/query_pipeline.py` — intent detection + sector/ticker entity extraction; semantic search uses vector cosine distance
@@ -205,6 +207,10 @@ Stocktwits excluded from all mention counts. Redis keys: `trending:global`, `tre
 | `NEWS_API_KEY` | news_ingestor |
 | `REDDIT_CLIENT_ID / SECRET / USER_AGENT` | social_ingestor |
 | `TWITTER_BEARER_TOKEN` | social_ingestor (requires paid credits) |
+| `OLLAMA_BASE_URL` | llm_analyzer (default: `http://ollama:11434`) |
+| `OLLAMA_MODEL` | llm_analyzer (default: `llama3.1:8b`) |
+| `OLLAMA_MAX_CONCURRENCY` | llm_analyzer (default: 1) |
+| `OLLAMA_TIMEOUT` | llm_analyzer in seconds (default: 120) |
 
 ## Frontend Tech Stack
 | Package | Version | Purpose |
