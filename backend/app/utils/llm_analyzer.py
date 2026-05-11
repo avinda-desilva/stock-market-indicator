@@ -112,6 +112,7 @@ async def _call_ollama(prompt_user: str) -> str:
             {"role": "user", "content": prompt_user},
         ],
         "stream": False,
+        "keep_alive": -1,  # keep model loaded indefinitely between ingestor runs
         "options": {
             # Deterministic output — we need strict JSON, not creative prose.
             "temperature": 0.0,
